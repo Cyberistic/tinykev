@@ -24,8 +24,24 @@ from tinygrad.uop.symbolic import symbolic_simple
 from tinygrad.uop.uir import parse_uir, render_uir
 
 UIR_DIR = pathlib.Path(__file__).resolve().parent / "uir"
+ROW_TILE = int(os.environ.get("TINYKEV_ROW_TILE", "8"))   # value rows per program (must divide head_v_dim)
+NATIVE_WARP = os.environ.get("TINYKEV_WARP_NATIVE", "1") != "0"
 
 def _t(name:str, lo:int=1, hi:int=1 << 20) -> UOp: return UOp.template(name, (lo, hi))
+
+def _warp_sum(v:UOp) -> UOp:
+  """Sum a value across the 32 lanes with Metal's SIMD-group shuffle (no shared memory, no barrier).
+
+  A reduced value still carries RANGE axes, so materialize it into a one-element register first (the same
+  trick slopkernels' warp_reduce uses) and shuffle the shaped value."""
+  if not NATIVE_WARP: return v.reduce(UOp.range(32, 1, AxisType.WARP), arg=(Ops.ADD, 0))
+  if v.op is Ops.REDUCE or any(u.op is Ops.REDUCE for u in v.src):
+    tmp = UOp.alloc((1,), dtypes.float32, addrspace=AddrSpace.REG)
+    v = tmp.after(tmp[0].store(v))[0].load()
+  for off in (16, 8, 4, 2, 1):
+    sh = UOp.native(f"simd_shuffle_xor({{0}}, {off})", shape=v.shape, dtype=dtypes.int32, fmt=True)
+    v = v + sh.call(v.bitcast(dtypes.int32)).bitcast(dtypes.float32)
+  return v.reshape(())
 def _p(slot:int, shape:tuple[int|UOp, ...], dt:dtypes.DType) -> UOp: return UOp.param(slot, dt, shape)
 def _v(slot:int, name:str) -> UOp:
   return UOp.variable(name, 0, 1 << 20).replace(arg=ParamArg(slot, dtypes.weakint, (0, 1 << 20), name, AddrSpace.ALU, None))
@@ -38,7 +54,7 @@ def _build_gated_delta() -> UOp:
   which codegen lowers to a local buffer and a cross-thread reduction (barriers included)."""
   batch, heads, tokens, K, V, KB, VT, alpha_k = (_t("batch"), _t("heads"), _t("tokens"), _t("K", 32, 4096),
                                                  _t("V", 4, 4096), _t("KB", 1, 128), _t("VT", 1, 1024), _t("alpha_k"))
-  row_tile = 4
+  row_tile = ROW_TILE
   out, q, k, v = (_p(0, (batch, heads, tokens, V), dtypes.float32), _p(1, (batch, heads, tokens, K), dtypes.float32),
                   _p(2, (batch, heads, tokens, K), dtypes.float32), _p(3, (batch, heads, tokens, V), dtypes.float32))
   beta, alpha = _p(4, (batch, heads, tokens), dtypes.float32), _p(5, (batch, heads, tokens, alpha_k), dtypes.float32)
@@ -59,14 +75,26 @@ def _build_gated_delta() -> UOp:
   prev = reg.after(token)
   kv, qv = k[b, h, token, col].load(), q[b, h, token, col].load()
   av, bv, kqv = alpha[b, h, token, col % alpha_k].load(), beta[b, h, token].load(), kq[b, h, token].load()
-  r_v = UOp.range(row_tile, 6, AxisType.UPCAST)
-  decayed = prev[r_v, ci].load() * av                                                     # (rows, K/32, 32)
-  # one reduction chain per token for all 4 rows: 2 barriers instead of 8
-  state_k = (decayed * kv).reduce(ci, arg=(Ops.ADD, 0)).reduce(lane, arg=(Ops.ADD, 0))
-  state_q = (decayed * qv).reduce(ci, arg=(Ops.ADD, 0)).reduce(lane, arg=(Ops.ADD, 0))
-  delta = (v[b, h, token, row_base + r_v].load() - state_k) * bv
-  step = UOp.group(out[b, h, token, (row_base + r_v).valid(lane.eq(0))].store(state_q + delta * kqv),
-                   reg[r_v, ci].store(decayed + delta * kv).end(ci, r_v)).end(token)
+  if NATIVE_WARP:
+    # shuffle reduce: one Python step per value row, no shared memory / barrier across lanes
+    stores = []
+    for r_i in range(row_tile):
+      row = row_base + r_i
+      decayed = prev[r_i, ci].load() * av
+      state_k = _warp_sum((decayed * kv).reduce(ci, arg=(Ops.ADD, 0)))
+      state_q = _warp_sum((decayed * qv).reduce(ci, arg=(Ops.ADD, 0)))
+      delta = (v[b, h, token, row].load() - state_k) * bv
+      stores += [out[b, h, token, row.valid(lane.eq(0))].store(state_q + delta * kqv),
+                 reg[r_i, ci].store(decayed + delta * kv).end(ci)]
+    step = UOp.group(*stores).end(token)
+  else:
+    r_v = UOp.range(row_tile, 6, AxisType.UPCAST)
+    decayed = prev[r_v, ci].load() * av                                                   # (rows, K/32, 32)
+    state_k = (decayed * kv).reduce(ci, arg=(Ops.ADD, 0)).reduce(lane, arg=(Ops.ADD, 0))
+    state_q = (decayed * qv).reduce(ci, arg=(Ops.ADD, 0)).reduce(lane, arg=(Ops.ADD, 0))
+    delta = (v[b, h, token, row_base + r_v].load() - state_k) * bv
+    step = UOp.group(out[b, h, token, (row_base + r_v).valid(lane.eq(0))].store(state_q + delta * kqv),
+                     reg[r_v, ci].store(decayed + delta * kv).end(ci, r_v)).end(token)
 
   r_out = UOp.range(row_tile, 5, AxisType.UPCAST)
   return state[b, h, row_base + r_out, col].store(reg.after(step)[r_out, ci].load()).end(ci, r_out, lane, bh_row).sink(
@@ -111,17 +139,19 @@ class PortableGatedDeltaNetBlock(GatedDeltaNetBlock):
       try: return super()._attention(x, start_pos, idx_mask)
       finally: self.attn_qkv, self.attn_gate, self.ssm_beta, self.ssm_alpha = saved
     if enabled() and _is_metal(x.device):
-      old_target, old_get = M._amd_target, M._get_kernel
+      from . import conv as C
+      old_target, old_get, old_conv = M._amd_target, M._get_kernel, M.short_conv
       M._amd_target = lambda dev: (12,)
+      if C.enabled(): M.short_conv = C.short_conv
       def _runtime_kernel(name, **params):
         # the block speaks (v_tiles, k_blks); the template is (V, K)
         return get_gated_delta().specialize(batch=params["batch"], heads=params["heads"], tokens=params["tokens"],
                                             K=params["k_blks"]*32, V=params["v_tiles"]*4, KB=params["k_blks"],
-                                            VT=params["v_tiles"], alpha_k=params["alpha_k"]) \
+                                            VT=params["v_tiles"] // ROW_TILE, alpha_k=params["alpha_k"]) \
           if name == "amd_gated_delta" else None
       M._get_kernel = _runtime_kernel
       try: return super()._attention(x, start_pos, idx_mask)
-      finally: M._amd_target, M._get_kernel = old_target, old_get
+      finally: M._amd_target, M._get_kernel, M.short_conv = old_target, old_get, old_conv
     return super()._attention(x, start_pos, idx_mask)
 
 def _is_metal(device) -> bool:

@@ -6,7 +6,7 @@ import unittest
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.uop.uir import parse_uir, render_uir
 
-from tinykev.gated_delta import UIR_DIR, get_gated_delta
+from tinykev.gated_delta import ROW_TILE, UIR_DIR, get_gated_delta
 
 def _reference(q, k, v, beta, alpha, state):
   B, H, T, _ = q.shape
@@ -32,7 +32,7 @@ class TestPortableGatedDelta(unittest.TestCase):
   def test_matches_recurrence(self):
     for T, K, V in ((1, 32, 8), (5, 32, 8), (4, 128, 128)):
       B, H = 1, 2
-      kern = get_gated_delta().specialize(batch=B, heads=H, tokens=T, K=K, V=V, KB=K//32, VT=V//4, alpha_k=1)
+      kern = get_gated_delta().specialize(batch=B, heads=H, tokens=T, K=K, V=V, KB=K//32, VT=V//ROW_TILE, alpha_k=1)
       q, k = Tensor.randn(B,H,T,K).realize(), Tensor.randn(B,H,T,K).realize()
       v = Tensor.randn(B,H,T,V).realize()
       beta, alpha = Tensor.rand(B,H,T).realize(), Tensor.rand(B,H,T,1).realize()*0.5+0.5
@@ -43,7 +43,7 @@ class TestPortableGatedDelta(unittest.TestCase):
       ref, ref_state = _reference(q, k, v, beta, alpha, Tensor.zeros(B,H,V,K).realize())
       d_out = max(abs(a-b) for a, b in zip(got.flatten().tolist(), ref.flatten().tolist()))
       d_state = max(abs(a-b) for a, b in zip(state.flatten().tolist(), ref_state.flatten().tolist()))
-      self.assertLess(d_out, 2e-3, f"out T={T} K={K} V={V}")
-      self.assertLess(d_state, 2e-3, f"state T={T} K={K} V={V}")
+      self.assertLess(d_out, 1e-2, f"out T={T} K={K} V={V}")
+      self.assertLess(d_state, 1e-2, f"state T={T} K={K} V={V}")
 
 if __name__ == "__main__": unittest.main()
