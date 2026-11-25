@@ -6,8 +6,8 @@ Kev-0.8B (101 tokens, M2 Pro, fp16, 20-iter medians):
 
 |Backend|ms|
 |---|---|
-|**tinykev (Metal, cached prefix)**|**20.0** (min 19.6)|
-|**tinykev (Metal, cold packed)**|**24.6** (min 24.4)|
+|**tinykev (Metal, cached prefix)**|**19.5** (min 19.1)|
+|**tinykev (Metal, cold packed)**|**24.5** (min 24.3)|
 |Kev MLX, cached prefix|45.5|
 |Kev MLX, row form|58.0|
 |Kev MLX, serving `probs`|67.1|

@@ -164,20 +164,18 @@ def _build_fused_conv_wy(H:int, N:int, NC:int, P:int, K:int, V:int,
         ka_l[e] = ka_l[e] + s_val[j].where(k_t[e].float(), kp_t[e].float()) * wk[e][j]
         va_l[e] = va_l[e] + s_val[j].where(v_t[e].float(), vp_t[e].float()) * wv[e][j]
   else:
-    q3 = _load4(p_flat, (tok_rs * P + q_base).valid(vr))
-    k3 = _load4(p_flat, (tok_rs * P + k_base_c).valid(vr))
-    v3 = _load4(p_flat, (tok_rs * P + v_base_c).valid(vr))
-    qa_l = [q3[e].float() * wq[e][3] for e in range(4)]
-    ka_l = [k3[e].float() * wk[e][3] for e in range(4)]
-    va_l = [v3[e].float() * wv[e][3] for e in range(4)]
-    for j in range(3):
-      q_t = _load4(p_flat, (s_safe[j] * P + q_base).valid(vr & s_val[j]))
-      k_t = _load4(p_flat, (s_safe[j] * P + k_base_c).valid(vr & s_val[j]))
-      v_t = _load4(p_flat, (s_safe[j] * P + v_base_c).valid(vr & s_val[j]))
-      for e in range(4):
-        qa_l[e] = qa_l[e] + q_t[e].float() * wq[e][j]
-        ka_l[e] = ka_l[e] + k_t[e].float() * wk[e][j]
-        va_l[e] = va_l[e] + v_t[e].float() * wv[e][j]
+    qa_l, ka_l, va_l = [], [], []
+    for e in range(4):
+      ch = lane * 4 + e
+      qc_c, kc_c, vc_c = q_off + h * K + ch, k_off + h * K + ch, v_off + h * V + ch
+      qa = p_in[tok_rs, qc_c].load().float() * wq[e][3]
+      ka = p_in[tok_rs, kc_c].load().float() * wk[e][3]
+      va = p_in[tok_rs, vc_c].load().float() * wv[e][3]
+      for j in range(3):
+        qa = qa + s_val[j].where(p_in[s_safe[j], qc_c].load().float(), 0.0) * wq[e][j]
+        ka = ka + s_val[j].where(p_in[s_safe[j], kc_c].load().float(), 0.0) * wk[e][j]
+        va = va + s_val[j].where(p_in[s_safe[j], vc_c].load().float(), 0.0) * wv[e][j]
+      qa_l.append(qa); ka_l.append(ka); va_l.append(va)
 
   q_vals, k_vals, v_vals = [], [], []
   q_sq_l, k_sq_l = UOp.const(0.0, dtypes.float32), UOp.const(0.0, dtypes.float32)

@@ -361,11 +361,14 @@ def _attention_readout(blk, h_all:Tensor, h_ro:Tensor, pk:Pack, splitk:bool,
 def forward_prefix(model, ids:Tensor, pk:Pack, S:int) -> tuple[tuple[Tensor, Tensor], ...]:
   """Run the backbone on a shared state prefix (`S` tokens) and capture per-layer DeltaNet + KV cache states."""
   from tinygrad.llm.model import GatedDeltaNetBlock
-  from .rmsnorm import add_rmsnorm, rmsnorm
+  from .rmsnorm import add_rmsnorm, gather_rmsnorm, rmsnorm
   eps = model.config.norm_eps
-  x = model.token_embd(ids)[0]
   blks = model.blk
-  h = rmsnorm(x, blks[0].attn_norm.weight, eps)
+  if (xh := gather_rmsnorm(model.token_embd.weight, ids, blks[0].attn_norm.weight, eps)) is not None:
+    x, h = xh
+  else:
+    x = model.token_embd(ids)[0]
+    h = rmsnorm(x, blks[0].attn_norm.weight, eps)
   states: list[tuple[Tensor, Tensor]] = []
   last_i = len(blks) - 1
   for i, blk in enumerate(blks):
@@ -393,11 +396,14 @@ def forward_packed(model, ids:Tensor, pk:Pack, readout_only:bool=False,
   When `readout_only=True` and the final block is a fused full-attention block with `M_ro < N`, prunes the
   final layer to compute only the `M_ro` readout tokens (`decide + opts`) — 100% lossless.  Returns `(h, pruned)`."""
   from tinygrad.llm.model import GatedDeltaNetBlock
-  from .rmsnorm import add_rmsnorm, rmsnorm
+  from .rmsnorm import add_rmsnorm, gather_rmsnorm, rmsnorm
   eps = model.config.norm_eps
-  x = model.token_embd(ids)[0]                                        # (N, D)
   blks = model.blk
-  h = rmsnorm(x, blks[0].attn_norm.weight, eps)
+  if (xh := gather_rmsnorm(model.token_embd.weight, ids, blks[0].attn_norm.weight, eps)) is not None:
+    x, h = xh
+  else:
+    x = model.token_embd(ids)[0]                                      # (N, D)
+    h = rmsnorm(x, blks[0].attn_norm.weight, eps)
   last_i = len(blks) - 1
   for i, blk in enumerate(blks):
     pst = prefix_layers[i] if prefix_layers is not None else None

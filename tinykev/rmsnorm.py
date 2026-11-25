@@ -124,10 +124,50 @@ def _build_gated_rmsnorm(N:int, H:int, V:int, P:int, gate_off:int, eps:float, si
   return out[t, h * V + v2].store((normed * gate).cast(dtypes.half)).end(r2).end(lane, th).sink(
     arg=KernelInfo(name=f"gated_rmsnorm_{N}_{H}_{V}", opts_to_apply=()))
 
+def _build_gather_rmsnorm(V:int, N:int, D:int, eps:float) -> UOp:
+  """Fused embedding gather + initial RMSNorm: reads `embd[ids[t], :]` once, emits `(x, rmsnorm(x, w, eps))`."""
+  WAVES = 4
+  THREADS = WAVES * 32
+  E = D // THREADS
+  assert D % THREADS == 0
+  out_x = UOp.param(0, dtypes.half, (N, D))
+  out_h = UOp.param(1, dtypes.half, (N, D))
+  embd = UOp.param(2, dtypes.half, (V, D))
+  ids = UOp.param(3, dtypes.int32, (N,))
+  w = UOp.param(4, dtypes.half, (D,))
+
+  t = UOp.range(N, 0, AxisType.GLOBAL)
+  wid = UOp.range(WAVES, 1, AxisType.LOCAL)
+  lane = UOp.range(32, -1, AxisType.WARP)
+  tid = wid * 32 + lane
+  r = UOp.range(E, 2, AxisType.UPCAST)
+  col = tid * E + r
+
+  row = ids[t].load().maximum(0).minimum(V - 1)
+  xh = embd[row, col].load()
+  st_x = out_x[t, col].store(xh).end(r)
+  x_reg = UOp.alloc((E,), dtypes.float32, addrspace=AddrSpace.REG)
+  x_reg = x_reg.after(x_reg[r].store(xh.float()).end(r))
+  w_sq = _simd_sum((x_reg[r].load() * x_reg[r].load()).reduce(r, arg=(Ops.ADD, 0)))
+
+  smem = UOp.alloc((WAVES,), dtypes.float32, addrspace=AddrSpace.LOCAL)
+  smem = smem.after(smem[wid.valid(lane.eq(0))].store(w_sq).barrier())
+  tot = smem[0].load() + smem[1].load() + smem[2].load() + smem[3].load()
+  inv = (tot * (1.0 / D) + eps).rsqrt()
+
+  r2 = UOp.range(E, 3, AxisType.UPCAST)
+  col2 = tid * E + r2
+  st_h = out_h[t, col2].store((x_reg[r2].load() * inv).cast(dtypes.half) * w[col2].load()).end(r2)
+  return UOp.group(st_x, st_h).end(lane, wid, t).sink(arg=KernelInfo(name=f"gather_rmsnorm_{N}_{D}", opts_to_apply=()))
+
 @functools.cache
 def get_rmsnorm(N:int, D:int, eps:float, fused_add:bool, sk:int=1) -> UOp:
   sfx = f"_sk{sk}" if (fused_add and sk > 1) else ""
   return _emit(f"{'add_' if fused_add else ''}rmsnorm_{N}_{D}{sfx}", _build_rmsnorm(N, D, eps, fused_add, sk))
+
+@functools.cache
+def get_gather_rmsnorm(V:int, N:int, D:int, eps:float) -> UOp:
+  return _emit(f"gather_rmsnorm_{V}_{N}_{D}", _build_gather_rmsnorm(V, N, D, eps))
 
 @functools.cache
 def get_gated_rmsnorm(N:int, H:int, V:int, P:int, gate_off:int, eps:float, silu_gate:bool) -> UOp:
@@ -135,6 +175,19 @@ def get_gated_rmsnorm(N:int, H:int, V:int, P:int, gate_off:int, eps:float, silu_
                _build_gated_rmsnorm(N, H, V, P, gate_off, eps, silu_gate))
 
 def enabled() -> bool: return os.environ.get("TINYKEV_RMSNORM_UIR", "1") != "0"
+
+def gather_rmsnorm(embd:Tensor, ids:Tensor, w:Tensor, eps:float) -> tuple[Tensor, Tensor]|None:
+  """Returns `(embd[ids], rmsnorm(embd[ids], w, eps))` in one Metal UIR kernel, or None when unsupported."""
+  V, D = embd.shape
+  N = ids.numel()
+  if not (enabled() and _is_metal(embd.device)) or embd.dtype is not dtypes.float16 \
+      or w.dtype is not dtypes.float16 or ids.dtype is not dtypes.int32 or D % 128 != 0:
+    return None
+  kern = get_gather_rmsnorm(V, N, D, eps)
+  ox = UOp.alloc((N, D), dtypes.half, device=embd.device)
+  oh = UOp.alloc((N, D), dtypes.half, device=embd.device)
+  call = kern.call(ox, oh, embd.contiguous().uop, ids.reshape(N).contiguous().uop, w.uop)
+  return Tensor(ox.after(call)), Tensor(oh.after(call))
 
 def rmsnorm(x:Tensor, w:Tensor, eps:float) -> Tensor:
   """`(N, D)` -> `(N, D)` single-pass UIR RMSNorm on Metal f16, with fallback."""

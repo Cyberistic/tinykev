@@ -478,37 +478,53 @@ def _build_ro_flash_attn(M_ro:int, N:int, R:int, L:int, nh:int, nkv:int, hd:int,
 
   row_base = ro_row[t].load().maximum(0).minimum(R - 1) * L
   pos_t = ro_pos[t].load().maximum(0).minimum(L - 1)
-
-  j = UOp.range(L, 10)
-  valid_j = j <= pos_t
-  kj = rows_idx[(row_base + j).valid(valid_j)].load()
   v_off_kh = nkv * hd + kh * hd
+
   if S_p > 0:
-    is_p = kj < S_p
-    kp_i, kb_i = kj.maximum(0).minimum(S_p - 1), (kj - S_p).maximum(0).minimum(N - 1)
-    k_val = is_p.where(k_pref[kp_i.valid(valid_j & is_p), kh, d].load(),
-                       k_in[kb_i.valid(valid_j & is_p.logical_not()), kh, d].load()).float()
-    v_val = is_p.where(v_pref[kp_i.valid(valid_j & is_p), kh * hd + d].load(),
-                       kv_all[kb_i.valid(valid_j & is_p.logical_not()), v_off_kh + d].load()).float()
+    # Phase 1: static prefix 0..S_p-1 directly from k_pref/v_pref (no rows_idx indirection, no branch)
+    jp = UOp.range(S_p, 10)
+    sc_p = _simd_sum((q_reg[e_u].load() * k_pref[jp, kh, d].load().float()).reduce(e_u, arg=(Ops.ADD, 0)))
+    mp, lp = m_reg.after(jp)[0].load(), l_reg.after(jp)[0].load()
+    mn_p = mp.maximum(sc_p)
+    al_p = ((mp - mn_p) * LOG2E).exp2()
+    w_p = ((sc_p - mn_p) * LOG2E).exp2()
+    upd1 = UOp.group(
+      m_reg[0].store(mn_p),
+      l_reg[0].store(lp * al_p + w_p),
+      acc[e_u].store(acc.after(jp)[e_u].load() * al_p + w_p * v_pref[jp, kh * hd + d].load().float()).end(e_u),
+    ).end(jp)
+    acc, m_reg, l_reg = acc.after(upd1), m_reg.after(upd1), l_reg.after(upd1)
+
+    # Phase 2: branch tokens S_p..L-1 directly from k_in/kv_all (no is_p branch)
+    jb = UOp.range(L - S_p, 11)
+    valid_j = (S_p + jb) <= pos_t
+    kj = (rows_idx[(row_base + S_p + jb).valid(valid_j)].load() - S_p).maximum(0).minimum(N - 1)
+    dot_b = (q_reg[e_u].load() * k_in[kj.valid(valid_j), kh, d].load().float()).reduce(e_u, arg=(Ops.ADD, 0))
+    sc_b = valid_j.where(_simd_sum(dot_b), UOp.const(-1e30, dtypes.float32))
+    mb, lb = m_reg.after(jb)[0].load(), l_reg.after(jb)[0].load()
+    mn_b = mb.maximum(sc_b)
+    al_b = ((mb - mn_b) * LOG2E).exp2()
+    w_b = valid_j.where(((sc_b - mn_b) * LOG2E).exp2(), UOp.const(0.0, dtypes.float32))
+    upd = UOp.group(
+      m_reg[0].store(mn_b),
+      l_reg[0].store(lb * al_b + w_b),
+      acc[e_u].store(acc.after(jb)[e_u].load() * al_b + w_b * kv_all[kj.valid(valid_j), v_off_kh + d].load().float()).end(e_u),
+    ).end(jb)
   else:
-    kj_s = kj.maximum(0).minimum(N - 1)
-    k_val = k_in[kj_s.valid(valid_j), kh, d].load().float()
-    v_val = kv_all[kj_s.valid(valid_j), v_off_kh + d].load().float()
-
-  dot_l = (q_reg[e_u].load() * k_val).reduce(e_u, arg=(Ops.ADD, 0))
-  score = valid_j.where(_simd_sum(dot_l), UOp.const(-1e30, dtypes.float32))
-
-  m_prev, l_prev = m_reg.after(j)[0].load(), l_reg.after(j)[0].load()
-  m_new = m_prev.maximum(score)
-  alpha = ((m_prev - m_new) * LOG2E).exp2()
-  w = valid_j.where(((score - m_new) * LOG2E).exp2(), UOp.const(0.0, dtypes.float32))
-
-  acc_prev = acc.after(j)
-  upd = UOp.group(
-    m_reg[0].store(m_new),
-    l_reg[0].store(l_prev * alpha + w),
-    acc[e_u].store(acc_prev[e_u].load() * alpha + w * v_val).end(e_u),
-  ).end(j)
+    j = UOp.range(L, 10)
+    valid_j = j <= pos_t
+    kj_s = rows_idx[(row_base + j).valid(valid_j)].load().maximum(0).minimum(N - 1)
+    dot_l = (q_reg[e_u].load() * k_in[kj_s.valid(valid_j), kh, d].load().float()).reduce(e_u, arg=(Ops.ADD, 0))
+    score = valid_j.where(_simd_sum(dot_l), UOp.const(-1e30, dtypes.float32))
+    m_prev, l_prev = m_reg.after(j)[0].load(), l_reg.after(j)[0].load()
+    m_new = m_prev.maximum(score)
+    alpha = ((m_prev - m_new) * LOG2E).exp2()
+    w = valid_j.where(((score - m_new) * LOG2E).exp2(), UOp.const(0.0, dtypes.float32))
+    upd = UOp.group(
+      m_reg[0].store(m_new),
+      l_reg[0].store(l_prev * alpha + w),
+      acc[e_u].store(acc.after(j)[e_u].load() * alpha + w * kv_all[kj_s.valid(valid_j), v_off_kh + d].load().float()).end(e_u),
+    ).end(j)
 
   inv_l = l_reg.after(upd)[0].load().reciprocal()
   acc_f = acc.after(upd)

@@ -101,7 +101,7 @@ class Kev:
                      R:int, L:int, N:int, n_decide:int, n_opts:int) -> Tensor:
     from .gather import gather_rows
     from .packed import Pack, forward_packed, set_pack
-    from .uir import readout
+    from .uir import fused_pointer_head, readout
     pk = Pack(R, L, N, rows_idx, pack_idx, flags, conv_src, chunk_tok, chunk_flags, tok_row, tok_pos, q_tiles,
               ro_idx, ro_row, ro_pos)
     prefix_layers = tuple((prefix_flat[i], prefix_flat[i + 1]) for i in range(0, len(prefix_flat), 2)) if prefix_flat else None
@@ -114,6 +114,9 @@ class Kev:
       try: h = self._hidden(ids)[0]
       finally: set_pack(self.model, None)
     qw, qb, kw, kb = self.head["q.weight"], self.head["q.bias"], self.head["k.weight"], self.head["k.bias"]
+    scale = (1.0 / math.sqrt(qw.shape[0])) / self.temperature
+    if pruned and (z := fused_pointer_head(h, qw, qb, kw, kb, owner, n_decide, n_opts, scale)) is not None:
+      return z.contiguous()
     if pruned:
       q = h[:n_decide].float() @ qw.T + qb
       k = h[n_decide:n_decide + n_opts].float() @ kw.T + kb
@@ -121,8 +124,7 @@ class Kev:
       q = gather_rows(h, decide).float() @ qw.T + qb
       k = gather_rows(h, opts).float() @ kw.T + kb
     if (z := readout(q.contiguous(), k.contiguous(), owner)) is None: z = (k * q[owner]).sum(-1)
-    z = z * (1.0 / math.sqrt(qw.shape[0]))
-    return (z if self.temperature == 1.0 else z / self.temperature).contiguous()
+    return (z * scale).contiguous()
 
   def _pack_inputs(self, key:tuple, lay:dict) -> list[Tensor]:
     """Reuse pre-allocated unified-memory int32 input buffers per shape key to avoid per-request MTLBuffer churn."""

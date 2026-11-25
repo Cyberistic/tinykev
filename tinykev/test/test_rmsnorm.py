@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 
 from tinygrad import Tensor, dtypes
-from tinykev.rmsnorm import add_rmsnorm, gated_rmsnorm, rmsnorm
+from tinykev.rmsnorm import add_rmsnorm, gather_rmsnorm, gated_rmsnorm, rmsnorm
 
 class TestRMSNorm(unittest.TestCase):
   def test_rmsnorm_and_add_rmsnorm(self):
@@ -45,5 +45,18 @@ class TestRMSNorm(unittest.TestCase):
     gate = p[:, qa:qa + H * V].reshape(N, H, V)
     ref = ((core.transpose(0, 1).rmsnorm(eps=eps) * w.float()) * gate.float().silu()).cast(dtypes.half).reshape(N, H * V).realize()
     self.assertLess((got.float() - ref.float()).abs().max().item(), 1e-2)
+
+  def test_gather_rmsnorm(self):
+    V, N, D, eps = 512, 80, 1024, 1e-6
+    embd = Tensor.randn(V, D, dtype=dtypes.half).realize()
+    ids = Tensor([(i * 13) % V for i in range(N)], dtype=dtypes.int32).realize()
+    w = (Tensor.randn(D, dtype=dtypes.half) * 0.2 + 1.0).realize()
+    res = gather_rmsnorm(embd, ids, w, eps)
+    self.assertIsNotNone(res)
+    gx, gh = res[0].realize(), res[1].realize()
+    rx = embd[ids].realize()
+    rh = (rx.float().rmsnorm(eps=eps).cast(dtypes.half) * w).realize()
+    self.assertLess((gx.float() - rx.float()).abs().max().item(), 1e-4)
+    self.assertLess((gh.float() - rh.float()).abs().max().item(), 5e-3)
 
 if __name__ == "__main__": unittest.main()
