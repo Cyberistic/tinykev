@@ -239,6 +239,22 @@ def fuse_mlp(model) -> int:
     n += 1
   return n
 
+def fuse_delta_proj(model) -> int:
+  """Concatenate each DeltaNet block's qkv/gate/beta/alpha projections into one N=8224 GEMM."""
+  n = 0
+  for blk in model.blk:
+    if not (hasattr(blk, "attn_qkv") and hasattr(blk, "attn_gate")) or hasattr(blk, "_proj"): continue
+    if getattr(blk.config.ssm, "kda", False): continue
+    ws = (blk.attn_qkv.weight, blk.attn_gate.weight, blk.ssm_beta.weight, blk.ssm_alpha.weight)
+    ends, total = [], 0
+    for w in ws[:-1]:
+      total += w.shape[0]; ends.append(total)
+    lin = nn.Linear(ws[0].shape[1], sum(w.shape[0] for w in ws), bias=False)
+    lin.weight = Tensor.cat(*ws, dim=0).contiguous().realize()
+    blk._proj, blk._proj_ends = lin, tuple(ends)
+    n += 1
+  return n
+
 def _install_transposed_linear() -> None:
   """Route `nn.Linear` through a pre-transposed weight (contiguous [in, out]) when one is present.
 
@@ -308,4 +324,5 @@ def load(run:str, max_context:int=8192, dtype:dtypes.DType=dtypes.float16, devic
   del sd
   if os.environ.get("TINYKEV_WT", "0") != "0": transpose_linears(model)
   if os.environ.get("TINYKEV_FUSE_MLP", "0") != "0": fuse_mlp(model)
+  if os.environ.get("TINYKEV_FUSE_DELTA", "0") != "0": fuse_delta_proj(model)
   return Loaded(model, meta, tc, run_dir)

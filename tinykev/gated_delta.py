@@ -86,6 +86,11 @@ def get_gated_delta() -> UOp:
 
 # ---- hook into tinygrad's existing DeltaNet kernel call ----
 
+class _Stash:
+  """Stand-in projection: returns its slice of a projection already computed for the whole block."""
+  def __init__(self, t:UOp, a:int, b:int): self.t, self.a, self.b = t, a, b
+  def __call__(self, _x): return self.t[..., self.a:self.b]
+
 class PortableGatedDeltaNetBlock(GatedDeltaNetBlock):
   """`GatedDeltaNetBlock` that runs its scan through the portable UIR kernel.
 
@@ -95,6 +100,16 @@ class PortableGatedDeltaNetBlock(GatedDeltaNetBlock):
 
   def _attention(self, x, start_pos, idx_mask=None):
     import tinygrad.llm.model as M
+    if getattr(self, "_proj", None) is not None and not self.config.ssm.kda:
+      # one [T,1024] x [1024, 8224] GEMM instead of qkv + gate + beta + alpha (kev.fused_qwen35 does this on CUDA).
+      # N=8224 tiles far better on Metal than N=6144: ~3.4 vs ~1.6 TFLOPS in isolation.
+      a, b, c = self._proj_ends
+      p = self._proj(x.half())
+      saved = (self.attn_qkv, self.attn_gate, self.ssm_beta, self.ssm_alpha)
+      self.attn_qkv, self.attn_gate, self.ssm_beta, self.ssm_alpha = (_Stash(p, 0, a), _Stash(p, a, b),
+                                                                      _Stash(p, b, c), _Stash(p, c, p.shape[-1]))
+      try: return super()._attention(x, start_pos, idx_mask)
+      finally: self.attn_qkv, self.attn_gate, self.ssm_beta, self.ssm_alpha = saved
     if enabled() and _is_metal(x.device):
       old_target, old_get = M._amd_target, M._get_kernel
       M._amd_target = lambda dev: (12,)
