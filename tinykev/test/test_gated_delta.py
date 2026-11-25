@@ -6,7 +6,7 @@ import unittest
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.uop.uir import parse_uir, render_uir
 
-from tinykev.gated_delta import ROW_TILE, UIR_DIR, get_gated_delta, kernel_params
+from tinykev.gated_delta import ROW_TILE, UIR_DIR, WRITE_STATE, get_gated_delta, kernel_params
 
 def _reference(q, k, v, beta, alpha, state):
   B, H, T, _ = q.shape
@@ -46,8 +46,9 @@ class TestPortableGatedDelta(unittest.TestCase):
                                       UOp.const(0, dtypes.weakint)))).realize()
       ref, ref_state = _reference(q, k, v, beta, alpha, Tensor.zeros(B,H,V,K).realize())
       d_out = max(abs(a-b) for a, b in zip(got.flatten().tolist(), ref.flatten().tolist()))
-      d_state = max(abs(a-b) for a, b in zip(state.flatten().tolist(), ref_state.flatten().tolist()))
       self.assertLess(d_out, 1e-2, f"out T={T} K={K} V={V}")
-      self.assertLess(d_state, 1e-2, f"state T={T} K={K} V={V}")
+      if WRITE_STATE:
+        d_state = max(abs(a-b) for a, b in zip(state.flatten().tolist(), ref_state.flatten().tolist()))
+        self.assertLess(d_state, 1e-2, f"state T={T} K={K} V={V}")
 
 if __name__ == "__main__": unittest.main()

@@ -325,6 +325,4 @@ def load(run:str, max_context:int=8192, dtype:dtypes.DType=dtypes.float16, devic
   Tensor.realize(*nn.state.get_parameters(model))
   del sd
   if os.environ.get("TINYKEV_WT", "0") != "0": transpose_linears(model)
-  if os.environ.get("TINYKEV_FUSE_MLP", "0") != "0": fuse_mlp(model)
-  if os.environ.get("TINYKEV_FUSE_DELTA", "0") != "0": fuse_delta_proj(model)
   return Loaded(model, meta, tc, run_dir)

@@ -26,6 +26,9 @@ from tinygrad.uop.uir import parse_uir, render_uir
 UIR_DIR = pathlib.Path(__file__).resolve().parent / "uir"
 ROW_TILE = int(os.environ.get("TINYKEV_ROW_TILE", "8"))   # value rows per program (must divide head_v_dim)
 NATIVE_WARP = os.environ.get("TINYKEV_WARP_NATIVE", "1") != "0"
+# Kev's row form always starts at position 0 (or restores the state from a snapshot), so the final recurrent
+# state is never read back.  Skipping its 128x128 store saves ~25 MB of writes per layer.
+WRITE_STATE = os.environ.get("TINYKEV_SCAN_STATE", "0") != "0"
 
 def _t(name:str, lo:int=1, hi:int=1 << 20) -> UOp: return UOp.template(name, (lo, hi))
 
@@ -96,6 +99,7 @@ def _build_gated_delta() -> UOp:
     step = UOp.group(out[b, h, token, (row_base + r_v).valid(lane.eq(0))].store(state_q + delta * kqv),
                      reg[r_v, ci].store(decayed + delta * kv).end(ci, r_v)).end(token)
 
+  if not WRITE_STATE: return step.end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_portable", opts_to_apply=()))
   r_out = UOp.range(row_tile, 5, AxisType.UPCAST)
   return state[b, h, row_base + r_out, col].store(reg.after(step)[r_out, ci].load()).end(ci, r_out, lane, bh_row).sink(
     arg=KernelInfo(name="gated_delta_portable", opts_to_apply=()))
@@ -167,7 +171,7 @@ def install(model) -> int:
   """Give every GatedDeltaNet block in `model` the portable scan. Returns the number of blocks changed."""
   n = 0
   for blk in model.blk:
-    if type(blk) is GatedDeltaNetBlock:
+    if isinstance(blk, GatedDeltaNetBlock) and not isinstance(blk, PortableGatedDeltaNetBlock):
       blk.__class__ = PortableGatedDeltaNetBlock
       n += 1
   return n

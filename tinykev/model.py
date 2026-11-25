@@ -34,6 +34,9 @@ class Kev:
     install_gemm()
     from .gated_delta import enabled as delta_uir_enabled, install as install_delta_uir
     self.portable_blocks = install_delta_uir(self.model) if delta_uir_enabled() else 0
+    from .weights import fuse_delta_proj, fuse_mlp
+    if os.environ.get("TINYKEV_FUSE_MLP", "0") != "0": fuse_mlp(self.model)
+    if os.environ.get("TINYKEV_FUSE_DELTA", "0") != "0": fuse_delta_proj(self.model)
     self.head = {k: v.to(self.device) for k, v in loaded.meta["head"].items()}
     self.temperature = float(loaded.meta.get("temperature", 1.0))
     self.head_dim = int(loaded.meta.get("head_dim", 256))
@@ -139,6 +142,19 @@ class Kev:
       out.append(self._run(t, (1, len(r), start), start)[0])
     return out
 
+  def _grouped_branches(self, start:int, rows:list[list[int]], pad_id:int=0) -> list[Tensor]:
+    """Branch rows in similar-length groups: cuts padding (42/15/22 -> 42 + 22 instead of 3x42)."""
+    order = sorted(range(len(rows)), key=lambda i: len(rows[i]), reverse=True)
+    groups:list[list[int]] = []
+    for i in order:
+      if groups and len(rows[i]) >= 0.6 * len(rows[groups[-1][0]]): groups[-1].append(i)
+      else: groups.append([i])
+    out:list[Tensor|None] = [None]*len(rows)
+    for g in groups:
+      hs = self._branches_hidden(start, [rows[i] for i in g], pad_id)
+      for j, i in enumerate(g): out[i] = hs[j, :len(rows[i])]
+    return out
+
   def _branches_hidden(self, start:int, rows:list[list[int]], pad_id:int=0) -> Tensor:
     batch, L = len(rows), max(len(r) for r in rows)
     created = (bc := self._branch_caches.get(batch)) is None
@@ -173,7 +189,10 @@ class Kev:
     With prefix reuse the state runs once and the branch rows continue from its caches; otherwise every
     question is a full `state + branch` row, all batched in one padded pass."""
     state_ids, _, rows = rows_of(enc)
-    if self.use_prefix == 2:
+    if self.use_prefix == 3:
+      start, off = self.prefix_for(state_ids), 0
+      hs = self._grouped_branches(start, [r["ids"] for r in rows])
+    elif self.use_prefix == 2:
       start, off = self.prefix_for(state_ids), 0
       hs = self._branch_rows_hidden(start, [r["ids"] for r in rows])
     elif self.use_prefix:
@@ -195,7 +214,7 @@ class Kev:
       else: hs = self.hidden_batch(full)
     out = []
     for i, r in enumerate(rows):
-      if self.use_prefix == 2: h = hs[i]
+      if self.use_prefix in (2, 3): h = hs[i]
       elif self.use_prefix: h = hs[i, :len(r["ids"])]
       elif isinstance(hs, list): h = hs[i][:off + len(r["ids"])]
       else: h = hs[i, :off + len(r["ids"])]
