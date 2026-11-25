@@ -25,24 +25,24 @@ Working end to end on Metal with `jaredpalmer/kev-0.8b`:
 * fp32 hidden states vs HF `transformers` 5.24 on the same inputs: **max |diff| 0.06, mean 0.0055** (reference
   activations have mean |x| ≈ 1.69), and question probabilities agree to **≈1e-3**;
 * fp16 weights reproduce fp32 probabilities to **<2e-4**;
-* the readout **and the Gated DeltaNet scan** are templated UIR kernels in the `slopkernels` style; the scan's
-  cross-lane sum uses Metal `simd_shuffle_xor` (no shared memory, no barrier), and one 101-token request went from
-  **5.9 s to 76 ms cold / 64 ms warm** (77-92x).
+* the readout, the Gated DeltaNet scan, the short conv and the projections are UIR kernels in the `slopkernels` style;
+  the scan's cross-lane sum uses Metal `simd_shuffle_xor` (no barriers) and the GEMMs use a hand-scheduled WMMA tile;
+  one 101-token request went from **5.9 s to 71 ms cold / 65 ms warm** (83-94x).
 
 The 4B/9B adapters and the 27B full-weight checkpoint use the same code paths but have not been run here.
 
 ## Performance
 
 Kev-0.8B, one request: 22-token state, 3 questions, 101 tokens total, steady state after warmup, on an M-series Mac
-(Metal for tinykev, MLX for Kev, CPU for the torch reference):
+(Metal for tinykev, MLX for Kev, CPU for the torch reference; 10-20 iteration medians):
 
 | backend | per request |
 |---|---|
 | MLX, cached state prefix (`probs_with_prefix`) | **45.5 ms** |
 | MLX, row form (`forward_rows`, same algorithm as tinykev) | **58.0 ms** |
 | MLX, serving path (`probs`: state once + branch rows) | **67.1 ms** |
-| tinykev, Metal fp16, state cache warm (`TINYKEV_PREFIX=1`) | **64.2 ms** |
-| tinykev, Metal fp16, full rows (default) | **76.4 ms** |
+| tinykev, Metal fp16, state cache warm (`TINYKEV_PREFIX=1`) | **64.6 ms** |
+| tinykev, Metal fp16, full rows (default) | **71.0 ms** |
 | torch fp32 CPU (the exact path Kev's published numbers use) | **13.5 s** |
 
 ```bash
@@ -50,22 +50,23 @@ PYTHONPATH=vendor/tinygrad:. python scripts/bench.py --run jaredpalmer/kev-0.8b 
 TINYKEV_PREFIX=1 PYTHONPATH=vendor/tinygrad:. python scripts/bench.py --run jaredpalmer/kev-0.8b --max-context 1024
 ```
 
-What moved the needle, in order:
+What moved the needle:
 
 | change | effect |
 |---|---|
 | portable UIR gated-delta scan + TinyJit replay | 5.9 s -> 1.1 s |
 | `TC_OPT=2` (tinygrad's Metal tensor cores are off by default outside BEAM) | 1.1 s -> 114 ms |
 | one padded batch for all question rows | 114 -> 93 ms |
-| native `simd_shuffle_xor` warp reduce in the scan (no barriers) + 8 value rows/program | 94 -> 76 ms cold, 77 -> 64 ms warm |
-| `TinyJit(prune=True)`, state-prefix cache (`TINYKEV_PREFIX=1`) | included above |
+| hand-scheduled WMMA GEMM for every Linear (`tinykev/gemm.py`) | 93 -> 78 ms |
+| UIR short conv with real threadgroups (`tinykev/conv.py`) | 78 -> 73 ms |
+| `simd_shuffle_xor` scan reduce, 8 value rows/program | 73 -> 71 ms cold, -> 65 ms warm |
 
-The warm path (64.2 ms) now beats MLX's serving miss path (67.1 ms, 20-iteration medians). Cold (76.4 ms) is 14 %
-behind it, and both are still behind MLX's row form (58 ms) and its cached prefix (45.5 ms). The remaining gap is the projections: tinygrad's generic
-Metal GEMM schedule reaches ~2.3-3.5 TFLOPS against MLX's MPS kernels. `TC_OPT=2` already emits `simdgroup` WMMA.
-Attempts that did not pay off on Metal: `BEAM=1/2` (99 ms / 16 min and a Metal variant-limit error), fusing the MLP
-gate/up or the DeltaNet qkv+z+b+a projection (2.7-3.4x slower from a pathological fused kernel), a UIR short-conv
-kernel (neutral), transposed contiguous weights, bf16 weights, and the `TC_SELECT`/`TC_MIN_GLOBALS` variants.
+Cold is 6 % behind MLX's serving path, and warm is 12 % behind MLX's row form (42 % behind its cached prefix). The
+remaining gap is tensor-core tiling for the projection shapes at M=126-192: the custom kernels measure 1.5-2x over
+tinygrad's schedule in isolation, but the model is partly memory/latency bound, so the end-to-end gain is ~10 %.
+`BEAM=1` with a warm disk cache is slower (85 ms); `BEAM=2` exceeds Metal's variant limit; fusing the MLP or the
+DeltaNet projections makes the scheduler emit one pathological kernel and is 3x slower; bf16, transposed weights and
+the `TC_SELECT`/`TC_MIN_GLOBALS` knobs are neutral or worse.
 
 ## Quick start
 
@@ -159,6 +160,12 @@ The kernel fuses the gather of the option rows against the projected query and t
 not AMD-specific — it is ordinary tinygrad IR and runs on Metal/CPU too. `TINYKEV_UIR=0` forces the Tensor-op path,
 which is the fallback if the kernel cannot be built.
 
+`tinykev/gemm.py` is a hand-scheduled WMMA GEMM used for every `tinygrad.llm.model.Linear`: TC + 4x M upcast + a
+per-shape (N upcast, N local) tile, with f32 accumulation in the tensor cores and a cast to f16 on store. The ranges
+must be WEAK (LOOP axes are refused by the TC opt), the M upcast is chosen from `ceil(M/8)` (M=192 -> 4, M=144 -> 3),
+and `tinykev/uir/gemm_<M>_<K>_<N>.uir` is generated per shape. `tinykev/conv.py` is the DeltaNet short conv as one
+elementwise kernel (128-thread workgroups x 8 channel upcast; 2.8x the reference kernel).
+
 `tinykev/gated_delta.py` is the bigger one: it is `slopkernels`' `gated_delta_prefill` layout with the AMD
 `ds_swizzle` warp reduce replaced by Metal `simd_shuffle_xor` (`_warp_sum`: five XOR shuffles and adds on the reduced
 value, no shared memory and no barrier), reading `TINYKEV_ROW_TILE` value rows per program (default 8). 32 lanes
@@ -193,13 +200,12 @@ reference; probabilities are unaffected at this scale.
 
 ## Limitations / next steps
 
-* **GEMM tiling is the wall.** The portable UIR kernels removed the scan and readout bottlenecks (the scan is now
-  ~7 ms of the request); the projections still go through tinygrad's generic Metal schedule. A hand-scheduled WMMA
-  GEMM (or a fused DeltaNet layer) is the next step; `TC_OPT=2` already emits `simdgroup` code, so this is tiling,
-  not a missing instruction. A hand-written custom-kernel matmul currently cannot attach the TC opt (the scheduler
-  refuses it on that AST), and `BEAM` either picks worse schedules or exceeds Metal's variant limit.
-* **The short-conv UIR kernel is optional** (`TINYKEV_CONV_UIR=1`, default off): it matches the reference but is
-  neutral in the full model, so the reference conv stays.
+* **GEMM tiling is still the wall.** The hand-scheduled GEMM is 1.5-2x per kernel but the model is partly memory and
+  latency bound, so the end-to-end gain is ~10 %. A fused DeltaNet layer (projection + conv + scan + norm in one
+  kernel) is the next step; the projection fusion done at the Tensor level is slower because the scheduler merges the
+  consumer into a pathological 30-range kernel.
+* **The scan's VT is `head_v_dim/ROW_TILE`**, not `v_tiles/ROW_TILE`; `kernel_params` is unit-tested because getting
+  this wrong silently computes a quarter of the value rows.
 * **State-prefix reuse is opt-in** (`TINYKEV_PREFIX=1`). It keeps separate stable cache buffers for the state pass
   (B=1) and the branch pass (B=3), both `TinyJit`-captured, and copies the state into the branch buffers per request.
   The padded branch batch (M=126) is less GEMM-efficient than the full 192-position batch, so it only wins warm.

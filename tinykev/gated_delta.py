@@ -145,9 +145,7 @@ class PortableGatedDeltaNetBlock(GatedDeltaNetBlock):
       if C.enabled(): M.short_conv = C.short_conv
       def _runtime_kernel(name, **params):
         # the block speaks (v_tiles, k_blks); the template is (V, K)
-        return get_gated_delta().specialize(batch=params["batch"], heads=params["heads"], tokens=params["tokens"],
-                                            K=params["k_blks"]*32, V=params["v_tiles"]*4, KB=params["k_blks"],
-                                            VT=params["v_tiles"] // ROW_TILE, alpha_k=params["alpha_k"]) \
+        return get_gated_delta().specialize(**kernel_params(**params)) \
           if name == "amd_gated_delta" else None
       M._get_kernel = _runtime_kernel
       try: return super()._attention(x, start_pos, idx_mask)
@@ -157,6 +155,11 @@ class PortableGatedDeltaNetBlock(GatedDeltaNetBlock):
 def _is_metal(device) -> bool:
   d = device if isinstance(device, str) else (device[0] if isinstance(device, tuple) and device else None)
   return isinstance(d, str) and d.split(":")[0] == "METAL"
+
+def kernel_params(**params:int) -> dict:
+  """Block call parameters -> kernel template values. `v_tiles` is head_v_dim/4; the kernel's VT is head_v_dim/ROW_TILE."""
+  return dict(batch=params["batch"], heads=params["heads"], tokens=params["tokens"], K=params["k_blks"]*32,
+              V=params["v_tiles"]*4, KB=params["k_blks"], VT=params["v_tiles"]*4 // ROW_TILE, alpha_k=params["alpha_k"])
 
 def enabled() -> bool: return os.environ.get("TINYKEV_DELTA_UIR", "1") != "0"
 

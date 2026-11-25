@@ -6,7 +6,7 @@ import unittest
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.uop.uir import parse_uir, render_uir
 
-from tinykev.gated_delta import ROW_TILE, UIR_DIR, get_gated_delta
+from tinykev.gated_delta import ROW_TILE, UIR_DIR, get_gated_delta, kernel_params
 
 def _reference(q, k, v, beta, alpha, state):
   B, H, T, _ = q.shape
@@ -20,6 +20,10 @@ def _reference(q, k, v, beta, alpha, state):
   return Tensor.stack(*out, dim=2), S
 
 class TestPortableGatedDelta(unittest.TestCase):
+  def test_hook_vt_matches_value_dim(self):
+    # regression: VT is head_v_dim/ROW_TILE, i.e. v_tiles*4/ROW_TILE (not v_tiles/ROW_TILE)
+    self.assertEqual(kernel_params(batch=1, heads=16, tokens=64, v_tiles=32, k_blks=4, alpha_k=1)["VT"], 128 // ROW_TILE)
+    self.assertEqual(kernel_params(batch=1, heads=16, tokens=64, v_tiles=32, k_blks=4, alpha_k=1)["V"], 128)
   def test_uir_roundtrip(self):
     from tinygrad.uop.ops import Ops
     u = get_gated_delta()

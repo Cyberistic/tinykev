@@ -30,6 +30,8 @@ class Kev:
     self.group_rows = float(os.environ.get("TINYKEV_GROUP", "0"))  # 0 disables row grouping
     self.model = loaded.model
     self.device = device or Tensor.empty(0).device
+    from .gemm import install as install_gemm
+    install_gemm()
     from .gated_delta import enabled as delta_uir_enabled, install as install_delta_uir
     self.portable_blocks = install_delta_uir(self.model) if delta_uir_enabled() else 0
     self.head = {k: v.to(self.device) for k, v in loaded.meta["head"].items()}
@@ -139,11 +141,14 @@ class Kev:
 
   def _branches_hidden(self, start:int, rows:list[list[int]], pad_id:int=0) -> Tensor:
     batch, L = len(rows), max(len(r) for r in rows)
-    if (bc := self._branch_caches.get(batch)) is None:
+    created = (bc := self._branch_caches.get(batch)) is None
+    if created:
       bc = [(blk, name, axis, self._expand(t, batch, axis)) for blk, name, axis, t in self._prefix[2]]
       self._branch_caches[batch] = bc
-    # restore the state into the branch buffers (copies, so the state buffers stay pristine)
-    for (_, _, _, dst), (_, _, _, src) in zip(bc, self._prefix[2]): dst.assign(src.expand(tuple(dst.shape)))
+    # The attention KV prefix at 0..start is written once when the branch buffers are created and every branch
+    # pass only overwrites start.., so repeat requests only need the small recurrent/conv state restored.
+    for (_, name, _, dst), (_, _, _, src) in zip(bc, self._prefix[2]):
+      if created or name in ("recurrent_state", "conv_state"): dst.assign(src.expand(tuple(dst.shape)))
     self._set_caches(bc)
     t = Tensor([r + [pad_id]*(L-len(r)) for r in rows], dtype=dtypes.int32, device=self.device)
     return self._run(t, (-batch, L, start), start)

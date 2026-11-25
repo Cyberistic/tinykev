@@ -233,7 +233,8 @@ def fuse_mlp(model) -> int:
     base = type(blk)
     if base not in classes:
       classes[base] = type(f"Fused{base.__name__}", (_FusedFFN, base), {})
-    blk._gate_up = nn.Linear(blk.ffn_gate.weight.shape[1], blk.ffn_gate.weight.shape[0] + blk.ffn_up.weight.shape[0], bias=False)
+    from tinygrad.llm.model import Linear as LLMLinear
+    blk._gate_up = LLMLinear(blk.ffn_gate.weight.shape[1], blk.ffn_gate.weight.shape[0] + blk.ffn_up.weight.shape[0], bias=False)
     blk._gate_up.weight = Tensor.cat(blk.ffn_gate.weight, blk.ffn_up.weight, dim=0).contiguous().realize()
     blk.__class__ = classes[base]
     n += 1
@@ -249,7 +250,8 @@ def fuse_delta_proj(model) -> int:
     ends, total = [], 0
     for w in ws[:-1]:
       total += w.shape[0]; ends.append(total)
-    lin = nn.Linear(ws[0].shape[1], sum(w.shape[0] for w in ws), bias=False)
+    from tinygrad.llm.model import Linear as LLMLinear
+    lin = LLMLinear(ws[0].shape[1], sum(w.shape[0] for w in ws), bias=False)
     lin.weight = Tensor.cat(*ws, dim=0).contiguous().realize()
     blk._proj, blk._proj_ends = lin, tuple(ends)
     n += 1
