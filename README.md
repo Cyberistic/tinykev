@@ -1,7 +1,8 @@
 # tinykev
 
 Runs [Kev](https://github.com/jaredpalmer/kev) (open-source jev) decision models on [tinygrad](https://github.com/tinygrad/tinygrad) at 3x the speed on a macbook (metal).
-It's faster than my keystrokes and costs very little memory, like ~20ms fast. 
+
+It's almost faster than my keystrokes and costs very little memory, like ~20ms per decision. 
 so fast you can make it type-check everything you write or auto sort your downloads folder
 how is it so fast??? im so excited
 what? 
