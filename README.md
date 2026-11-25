@@ -38,11 +38,11 @@ Kev-0.8B, one request: 22-token state, 3 questions, 101 tokens total, steady sta
 
 | backend | per request |
 |---|---|
-| MLX, cached state prefix (`probs_with_prefix`) | **48 ms** |
-| MLX, row form (`forward_rows`, same algorithm as tinykev) | **60 ms** |
-| MLX, serving path (`probs`: state once + branch rows) | **71 ms** |
-| tinykev, Metal fp16, state cache warm (`TINYKEV_PREFIX=1`) | **64 ms** |
-| tinykev, Metal fp16, full rows (default) | **76 ms** |
+| MLX, cached state prefix (`probs_with_prefix`) | **45.5 ms** |
+| MLX, row form (`forward_rows`, same algorithm as tinykev) | **58.0 ms** |
+| MLX, serving path (`probs`: state once + branch rows) | **67.1 ms** |
+| tinykev, Metal fp16, state cache warm (`TINYKEV_PREFIX=1`) | **64.2 ms** |
+| tinykev, Metal fp16, full rows (default) | **76.4 ms** |
 | torch fp32 CPU (the exact path Kev's published numbers use) | **13.5 s** |
 
 ```bash
@@ -60,8 +60,8 @@ What moved the needle, in order:
 | native `simd_shuffle_xor` warp reduce in the scan (no barriers) + 8 value rows/program | 94 -> 76 ms cold, 77 -> 64 ms warm |
 | `TinyJit(prune=True)`, state-prefix cache (`TINYKEV_PREFIX=1`) | included above |
 
-The warm path (64 ms) now beats MLX's serving miss path (71 ms). Cold (76 ms) is 8 % behind it, and both are still
-behind MLX's row form (60 ms) and its cached prefix (48 ms). The remaining gap is the projections: tinygrad's generic
+The warm path (64.2 ms) now beats MLX's serving miss path (67.1 ms, 20-iteration medians). Cold (76.4 ms) is 14 %
+behind it, and both are still behind MLX's row form (58 ms) and its cached prefix (45.5 ms). The remaining gap is the projections: tinygrad's generic
 Metal GEMM schedule reaches ~2.3-3.5 TFLOPS against MLX's MPS kernels. `TC_OPT=2` already emits `simdgroup` WMMA.
 Attempts that did not pay off on Metal: `BEAM=1/2` (99 ms / 16 min and a Metal variant-limit error), fusing the MLP
 gate/up or the DeltaNet qkv+z+b+a projection (2.7-3.4x slower from a pathological fused kernel), a UIR short-conv
