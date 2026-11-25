@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinykev"
+version = "0.1.0"
+description = "Run Kev decision models on tinygrad"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "tokenizers>=0.20"]
+
+[project.urls]
+Repository = "https://github.com/Cyberistic/tinykev"
+
+[tool.setuptools]
+packages = ["tinykev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tinykev/test"]
