@@ -51,14 +51,14 @@ def get_readout() -> UOp:
 
 def enabled() -> bool: return os.environ.get("TINYKEV_UIR", "1") != "0"
 
-def readout(q:Tensor, k:Tensor) -> Tensor|None:
-  """`sum_p q[0, p] * k[m, p]` fused over all options in one kernel, or None when it is unavailable."""
-  if not enabled() or q.shape[0] != 1: return None
+def readout(q:Tensor, k:Tensor, owner:Tensor|None=None) -> Tensor|None:
+  """`sum_p q[owner[m], p] * k[m, p]` fused over all options in one kernel, or None when it is unavailable."""
+  if not enabled() or (owner is None and q.shape[0] != 1): return None
   try: kern = get_readout()
   except Exception: return None
   M, DP = k.shape
-  kern = kern.specialize(Q=1, M=M, DP=DP)
-  owner = Tensor.zeros(M, dtype=dtypes.int32, device=k.device)
+  kern = kern.specialize(Q=q.shape[0], M=M, DP=DP)
+  if owner is None: owner = Tensor.zeros(M, dtype=dtypes.int32, device=k.device)
   out = UOp.alloc((M,), dtypes.float32, device=k.device)
   call = kern.call(out, q.uop, k.uop, owner.uop)
   return Tensor(out.after(call))

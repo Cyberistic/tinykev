@@ -27,7 +27,7 @@ Working end to end on Metal with `jaredpalmer/kev-0.8b`:
 * fp16 weights reproduce fp32 probabilities to **<2e-4**;
 * the readout, the Gated DeltaNet scan, the short conv and the projections are UIR kernels in the `slopkernels` style;
   the scan's cross-lane sum uses Metal `simd_shuffle_xor` (no barriers) and the GEMMs use a hand-scheduled WMMA tile;
-  one 101-token request went from **5.9 s to 71 ms cold / 65 ms warm** (83-94x).
+  one 101-token request went from **5.9 s to 40 ms** (~150x), faster than every MLX path of the reference.
 
 The 4B/9B adapters and the 27B full-weight checkpoint use the same code paths but have not been run here.
 
@@ -41,8 +41,9 @@ Kev-0.8B, one request: 22-token state, 3 questions, 101 tokens total, steady sta
 | MLX, cached state prefix (`probs_with_prefix`) | **45.5 ms** |
 | MLX, row form (`forward_rows`, same algorithm as tinykev) | **58.0 ms** |
 | MLX, serving path (`probs`: state once + branch rows) | **67.1 ms** |
-| tinykev, Metal fp16, state cache warm (`TINYKEV_PREFIX=1`) | **64.6 ms** |
-| tinykev, Metal fp16, full rows (default) | **71.0 ms** |
+| **tinykev, Metal fp16, packed (default)** | **39.8 ms** (cold, `--cold`: 40.2 ms) |
+| tinykev, Metal fp16, state cache warm (`TINYKEV_PREFIX=1`, `TINYKEV_PACKED=0`) | 64.6 ms |
+| tinykev, Metal fp16, padded rows (`TINYKEV_PACKED=0`) | 69.3 ms |
 | torch fp32 CPU (the exact path Kev's published numbers use) | **13.5 s** |
 
 ```bash
@@ -60,9 +61,10 @@ What moved the needle:
 | hand-scheduled WMMA GEMM for every Linear (`tinykev/gemm.py`) | 93 -> 78 ms |
 | UIR short conv with real threadgroups (`tinykev/conv.py`) | 78 -> 73 ms |
 | `simd_shuffle_xor` scan reduce, 8 value rows/program | 73 -> 71 ms cold, -> 65 ms warm |
+| packed form: token-wise work on the 101 packed tokens, rows only inside the conv/scan/attention (`tinykev/packed.py`) | 69 -> 40 ms |
 
-Cold is 6 % behind MLX's serving path, and warm is 12 % behind MLX's row form (42 % behind its cached prefix). The
-remaining gap is tensor-core tiling for the projection shapes at M=126-192: the custom kernels measure 1.5-2x over
+The packed form beats every MLX path on this request: 40 % under its serving path, 31 % under its row form and 12 %
+under its cached prefix. Before it, the padded row form was 6 % behind MLX's serving path; the remaining gap there is tensor-core tiling for the projection shapes at M=126-192: the custom kernels measure 1.5-2x over
 tinygrad's schedule in isolation, but the model is partly memory/latency bound, so the end-to-end gain is ~10 %.
 `BEAM=1` with a warm disk cache is slower (85 ms); `BEAM=2` exceeds Metal's variant limit; fusing the MLP or the
 DeltaNet projections makes the scheduler emit one pathological kernel and is 3x slower; bf16, transposed weights and
@@ -176,6 +178,19 @@ the scan from ~62 ms of the request to ~7 ms. The hook is deliberately narrow:
 duration of the call and routes only that kernel name to the portable one, so the conv, gates, norm and layouts are
 still tinygrad's. `TINYKEV_DELTA_UIR=0` restores the unrolled fallback.
 
+### Packed form
+
+The row form recomputes the state once per question and pads every row to the longest (rows of 64/37/44 tokens
+become 192 GEMM rows for 101 real tokens). But only the sequence mixers need rows; embedding, norms, every projection
+and the MLPs are token-wise. `tinykev/packed.py` runs those on Kev's packed sequence (state once, then each branch,
+padded to a multiple of 16 so the WMMA M tile divides) and moves activations with a vectorized UIR row gather
+(`tinykev/gather.py`) only around the mixers: the DeltaNet qkv projection is gathered into `state + branch` rows for
+the short conv and the scan and the scan output is gathered back before the gated norm; attention gathers q/k/v into
+rows (positions 0..L-1, causal) and its output back before the gate and `o_proj`. Each token's math is exactly the
+row form's, so it matches it to 8e-5 in fp32 (f16: 2e-3, the usual f16 noise). The backbone, the pointer head and the
+readout are one `TinyJit` per (rows, row length, packed length, options) shape, and the softmax is done on host.
+`TINYKEV_PACKED=0` restores the row forms.
+
 ## Validation
 
 `scripts/parity_hf.py` loads the same checkpoint twice — tinykev and HF `transformers` + a manually merged adapter —
@@ -211,7 +226,8 @@ reference; probabilities are unaffected at this scale.
   The padded branch batch (M=126) is less GEMM-efficient than the full 192-position batch, so it only wins warm.
 * Long states still compile one conv/norm graph per shape; the token loop is gone from the recurrence, so compile time
   no longer scales with state length the way it did before the scan kernel.
-* `option_isolation` is not implemented: it needs the packed block-causal mask, which hybrid backbones cannot use.
+* `option_isolation` is not implemented.
+* A new request shape pays two JIT capture calls; row length is bucketed to 8 and packed length to 16 to limit that.
 * Full-weight checkpoints (`meta.weights == "full"`, the 27B) share the loader but were not exercised.
 * No HTTP server/streaming; the CLI mirrors the `/v1/systemone` response shape.
 
@@ -223,6 +239,8 @@ tinykev/encode.py      kev.model.encode / rows_of + /v1/systemone mapping
 tinykev/weights.py     downloads, config mapping, HF safetensors + LoRA merge, torch-free head.pt
 tinykev/model.py       hidden states + pointer head
 tinykev/uir.py         templated UIR readout kernel
+tinykev/packed.py      packed inference (token-wise work once per token, rows only in the mixers)
+tinykev/gather.py      UIR row gather between packed and row order
 tinykev/test/          tokenizer, encoder, tiny-model causality/head, UIR kernel
 scripts/parity_hf.py   numerical parity against HF transformers
 vendor/tinygrad        pinned tinygrad submodule

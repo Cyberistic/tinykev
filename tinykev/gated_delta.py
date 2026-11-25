@@ -164,6 +164,9 @@ class PortableGatedDeltaNetBlock(GatedDeltaNetBlock):
   def _attention(self, x, start_pos, idx_mask=None):
     import tinygrad.llm.model as M
     from . import fused_delta as FD
+    if (pk := getattr(self, "_pack", None)) is not None and not self.config.ssm.kda:
+      from .packed import delta_attention
+      return delta_attention(self, x, pk)
     if (epi := self._epilogue_attention(x, start_pos)) is not None: return epi
     if FD.enabled() and not self.config.ssm.kda and isinstance(start_pos[0], int) and x.dtype is dtypes.float16 \
         and self.head_k_dim % 32 == 0 and (self.head_v_dim // ROW_TILE) * ROW_TILE == self.head_v_dim:

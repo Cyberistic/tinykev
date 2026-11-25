@@ -2,8 +2,8 @@
 
     PYTHONPATH=vendor/tinygrad:. python scripts/bench.py --run jaredpalmer/kev-0.8b --iters 10
 
-The port runs Kev's row form (each question is `state + branch`, the state recomputed per question); Kev's
-serving path runs the state once and copies the recurrent/KV cache per question. Compare with `kev.probs`
+By default the port runs the packed form (every token once; rows only inside the sequence mixers, see
+`tinykev/packed.py`); `TINYKEV_PACKED=0` selects the row form (each question is `state + branch`). Compare with `kev.probs`
 (prefix path) on the reference backend, and with `kev.forward_rows` for the same algorithm.
 """
 from __future__ import annotations

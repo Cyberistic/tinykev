@@ -37,6 +37,10 @@ class Kev:
     from .weights import fuse_delta_proj, fuse_mlp
     if os.environ.get("TINYKEV_FUSE_MLP", "0") != "0": fuse_mlp(self.model)
     if os.environ.get("TINYKEV_FUSE_DELTA", "0") != "0": fuse_delta_proj(self.model)
+    from .packed import enabled as packed_enabled, install as install_packed
+    install_packed(self.model)
+    # packed form (default): every token once; TINYKEV_PACKED=0 or TINYKEV_PREFIX>0 selects the row forms
+    self.use_packed = packed_enabled() and not self.use_prefix and self.group_rows == 0
     self.head = {k: v.to(self.device) for k, v in loaded.meta["head"].items()}
     self.temperature = float(loaded.meta.get("temperature", 1.0))
     self.head_dim = int(loaded.meta.get("head_dim", 256))
@@ -223,4 +227,48 @@ class Kev:
 
   def probs(self, enc:dict) -> list[list[float]]:
     """Softmax over each question's options (Kev's `probs`, the serving miss path)."""
+    if self.use_packed: return self.probs_packed(enc)
     return [z.softmax(-1).tolist() for z in self.forward(enc)]
+
+  # ---- packed form: every token once (state + all branches), rows only inside the sequence mixers ----
+
+  def _packed_logits(self, ids:Tensor, rows_idx:Tensor, pack_idx:Tensor, decide:Tensor, opts:Tensor, owner:Tensor,
+                     R:int, L:int, N:int) -> Tensor:
+    from .gather import gather_rows
+    from .packed import Pack, set_pack
+    from .uir import readout
+    set_pack(self.model, Pack(R, L, N, rows_idx, pack_idx))
+    try: h = self._hidden(ids, 0)[0]
+    finally: set_pack(self.model, None)
+    qw, qb, kw, kb = self.head["q.weight"], self.head["q.bias"], self.head["k.weight"], self.head["k.bias"]
+    q = gather_rows(h, decide).float() @ qw.T + qb
+    k = gather_rows(h, opts).float() @ kw.T + kb
+    if (z := readout(q.contiguous(), k.contiguous(), owner)) is None: z = (k * q[owner]).sum(-1)
+    z = z * (1.0 / math.sqrt(qw.shape[0]))
+    return (z if self.temperature == 1.0 else z / self.temperature).contiguous()
+
+  def logits_packed(self, enc:dict) -> list[list[float]]:
+    from .packed import layout, prepare
+    lay = layout(enc)
+    R, L, N = lay["R"], lay["L"], lay["N"]
+    prepare(self.model, R, self.device)
+    args = [Tensor([lay["ids"]], dtype=dtypes.int32, device=self.device)] + \
+           [Tensor(lay[k], dtype=dtypes.int32, device=self.device) for k in ("rows_idx", "pack_idx", "decide", "opts", "owner")]
+    key = ("packed", R, L, N, len(lay["decide"]), len(lay["opts"]))
+    if self.use_jit:
+      if (jit := self._jits.get(key)) is None:
+        jit = self._jits.setdefault(key, TinyJit(lambda *a: self._packed_logits(*a, R=R, L=L, N=N), prune=True))
+      z = jit(*args)
+    else: z = self._packed_logits(*args, R=R, L=L, N=N)
+    flat = z.tolist()
+    out, i = [], 0
+    for oi in enc["opt_idx"]:
+      out.append(flat[i:i+len(oi)]); i += len(oi)
+    return out
+
+  def probs_packed(self, enc:dict) -> list[list[float]]:
+    out = []
+    for zs in self.logits_packed(enc):
+      m = max(zs); e = [math.exp(v - m) for v in zs]; s = sum(e)
+      out.append([v / s for v in e])
+    return out
