@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import math
 
-from tinygrad import Tensor, dtypes
+from tinygrad import Tensor, TinyJit, dtypes
 
 from .encode import rows_of
 from .weights import Loaded
 
 class Kev:
-  def __init__(self, loaded:Loaded, device:str|None=None):
+  def __init__(self, loaded:Loaded, device:str|None=None, use_jit:bool=False):
     self.loaded = loaded
+    self.use_jit = use_jit
+    self._jits:dict[int, TinyJit] = {}
     self.model = loaded.model
     self.device = device or Tensor.empty(0).device
     self.head = {k: v.to(self.device) for k, v in loaded.meta["head"].items()}
@@ -25,8 +27,19 @@ class Kev:
     self.head_dim = int(loaded.meta.get("head_dim", 256))
 
   def hidden(self, ids:list[int]) -> Tensor:
-    """`[len(ids), hidden]` final-norm hidden states of one causal row."""
+    """`[len(ids), hidden]` final-norm hidden states of one causal row.
+
+    With `use_jit`, each row length gets a `TinyJit` after its first two calls.  The DeltaNet layers are
+    unrolled one Python step per token, so rebuilding their graph per request costs far more than running
+    it; replay fixes that (Kev-0.8B, 101-token request: 5.9 s -> 0.97 s).  The first two calls per shape pay
+    the capture instead, which is why one-shot CLI use leaves this off."""
     t = Tensor([ids], dtype=dtypes.int32, device=self.device)
+    if self.use_jit:
+      if (jit := self._jits.get(len(ids))) is None: jit = self._jits.setdefault(len(ids), TinyJit(self._hidden))
+      return jit(t)
+    return self._hidden(t)
+
+  def _hidden(self, t:Tensor) -> Tensor:
     x = self.model.token_embd(t).float()
     idx_mask, pre = None, None
     for blk in self.model.blk:

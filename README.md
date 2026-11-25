@@ -29,6 +29,34 @@ Working end to end on Metal with `jaredpalmer/kev-0.8b`:
 
 The 4B/9B adapters and the 27B full-weight checkpoint use the same code paths but have not been run here.
 
+## Performance
+
+Kev-0.8B, one request: 22-token state, 3 questions, 101 tokens total, steady state after warmup, on an M-series Mac
+(Metal for tinykev, MLX for Kev, CPU for the torch reference):
+
+| backend | per request |
+|---|---|
+| MLX, cached state prefix (`probs_with_prefix`) | **48 ms** |
+| MLX, serving path (`probs`: state once + branch rows) | **71 ms** |
+| MLX, row form (same algorithm as tinykev, `forward_rows`) | **60 ms** |
+| tinykev, Metal fp16, `--jit` | **0.97 s** |
+| tinykev, Metal fp16, default | **5.9 s** |
+| torch fp32 CPU (the exact path Kev's published numbers use) | **13.5 s** |
+
+```bash
+PYTHONPATH=vendor/tinygrad:. python scripts/bench.py --run jaredpalmer/kev-0.8b --max-context 1024 --iters 10 --jit
+```
+
+`--jit` wraps each row length in `TinyJit`, so the DeltaNet graph is built and compiled once per shape and replayed.
+That is why it is ~6x faster for repeated requests; a single one-shot call pays the capture instead (worse than the
+default), so the CLI leaves it off unless asked.
+
+The remaining ~14x gap to MLX is kernel count, not math: tinygrad's Gated DeltaNet fallback is a Python loop over
+tokens inside each of the 18 DeltaNet layers, which turns one request into thousands of small kernel launches, while
+MLX's chunked delta rule does one pass per layer. The fix is a **chunked gated-delta UIR kernel** — `slopkernels`'
+`gated_delta_prefill` has the shape of it, but its warp reduction uses the AMD `ds_swizzle` intrinsic and needs a
+Metal-friendly reduction to be portable.
+
 ## Quick start
 
 ```bash

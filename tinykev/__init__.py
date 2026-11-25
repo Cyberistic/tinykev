@@ -21,7 +21,7 @@ from .weights import load, read_meta, resolve
 
 __all__ = ["load_kev", "encode", "rows_of", "to_record", "to_answers", "ContextOverflow", "Kev", "Tokenizer"]
 
-def load_kev(run:str, *, max_context:int=8192, device:str|None=None, dtype=None) -> tuple[Tokenizer, Kev, dict]:
+def load_kev(run:str, *, max_context:int=8192, device:str|None=None, dtype=None, jit:bool=False) -> tuple[Tokenizer, Kev, dict]:
   """Load a Kev checkpoint (`jaredpalmer/kev-0.8b`, `...@revision`, or a local run directory).
 
   `max_context` sizes the KV cache allocated by the attention layers; it must be at least the longest
@@ -29,4 +29,4 @@ def load_kev(run:str, *, max_context:int=8192, device:str|None=None, dtype=None)
   kw = {} if dtype is None else {"dtype": dtype}
   loaded = load(run, max_context=max_context, device=device, **kw)
   tok = Tokenizer(loaded.model_dir / "tokenizer.json")
-  return tok, Kev(loaded, device=device), loaded.meta
+  return tok, Kev(loaded, device=device, use_jit=jit), loaded.meta

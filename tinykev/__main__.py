@@ -14,6 +14,7 @@ def main(argv:list[str]|None=None) -> int:
   p.add_argument("--request", help="@path to a full /v1/systemone request JSON")
   p.add_argument("--max-context", type=int, default=8192, help="KV cache size; at least the longest state+branch row")
   p.add_argument("--device", default=None)
+  p.add_argument("--jit", action="store_true", help="replay row shapes through TinyJit (better for many requests)")
   args = p.parse_args(argv)
 
   if args.request:
@@ -27,7 +28,7 @@ def main(argv:list[str]|None=None) -> int:
     req = {"state": state, "questions": json.loads(questions)}
 
   rec, meta = to_record(req)
-  tok, kev, ck = load_kev(args.run, max_context=args.max_context, device=args.device)
+  tok, kev, ck = load_kev(args.run, max_context=args.max_context, device=args.device, jit=args.jit)
   enc = encode(tok, rec, max_state=args.max_context, max_branch=args.max_context, strict=True)
   probs = kev.probs(enc)
   print(json.dumps({"model": req.get("model", "kev"), "answers": to_answers(probs, meta),
