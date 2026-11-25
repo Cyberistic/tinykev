@@ -73,6 +73,8 @@ def resolve(run:str) -> tuple[pathlib.Path, dict]:
       # full-weight checkpoint: its own text config and the backbone shards
       _fetch(base + "/config.json", d / "config.json")
       _hub_shards(d, repo, rev or None)
+    else:
+      _fetch(base + "/adapter_config.json", d / "adapter_config.json")
   if not (d / "head.pt").exists(): raise FileNotFoundError(f"{d} has no head.pt")
   return d, read_meta(d / "head.pt")
 
@@ -158,11 +160,12 @@ def transformer_config(tc:dict, max_context:int) -> TransformerConfig:
     max_context=max_context, ssm=ssm, ssm_layers=tuple(t != "full_attention" for t in layers),
     attn_output_gate=tc.get("attn_output_gate", False))
 
-def hf_sources(tc:dict) -> dict[str, str]:
-  """tinygrad name -> HF safetensors name.  `mtp.*` and the vision tower are never read."""
-  names = {"token_embd.weight": BASE_PREFIX + "embed_tokens.weight", "output_norm.weight": BASE_PREFIX + "norm.weight"}
+def hf_sources(tc:dict, prefix:str=BASE_PREFIX) -> dict[str, str]:
+  """tinygrad name -> HF safetensors name.  `mtp.*` and the vision tower are never read.  Hub bases nest the
+  text tower under `model.language_model.`; a full `save_pretrained` of the text model has no prefix."""
+  names = {"token_embd.weight": prefix + "embed_tokens.weight", "output_norm.weight": prefix + "norm.weight"}
   for i, lt in enumerate(tc["layer_types"]):
-    p, t = f"{BASE_PREFIX}layers.{i}.", f"blk.{i}."
+    p, t = f"{prefix}layers.{i}.", f"blk.{i}."
     names[t+"attn_norm.weight"] = p + "input_layernorm.weight"
     names[t+"ffn_norm.weight"] = p + "post_attention_layernorm.weight"
     for tg, hf in (("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")):
@@ -182,8 +185,8 @@ def hf_sources(tc:dict) -> dict[str, str]:
 # RMSNorm weights are stored zero-centred (`1 + w`), except the Gated RMSNorm inside the DeltaNet mixer
 _ZERO_CENTERED = ("attn_norm.weight", "ffn_norm.weight", "output_norm.weight", "attn_q_norm.weight", "attn_k_norm.weight")
 
-def base_state_dict(base_dir:pathlib.Path, tc:dict) -> dict[str, Tensor]:
-  sources = hf_sources(tc)
+def base_state_dict(base_dir:pathlib.Path, tc:dict, prefix:str=BASE_PREFIX) -> dict[str, Tensor]:
+  sources = hf_sources(tc, prefix)
   sd = hf_load(base_dir, ("CPU",), sources, {})
   for name, t in list(sd.items()):
     if name.endswith("ssm_conv1d.weight"): sd[name] = t.squeeze(1)
@@ -194,8 +197,9 @@ def base_state_dict(base_dir:pathlib.Path, tc:dict) -> dict[str, Tensor]:
 def merge_lora(sd:dict[str, Tensor], adapter:pathlib.Path, tc:dict, device:str) -> int:
   """Fold a PEFT adapter into the state dict: `W + (B @ A) * alpha / r`, fp32, rounded once to the base dtype."""
   cfg_path = adapter / "adapter_config.json"
-  acfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
-  alpha = acfg.get("lora_alpha", 0) / ((acfg.get("r", 0) ** 0.5) if acfg.get("use_rslora") else acfg.get("r", 1))
+  if not cfg_path.exists(): raise FileNotFoundError(f"{adapter} has an adapter but no adapter_config.json")
+  acfg = json.loads(cfg_path.read_text())
+  alpha = acfg["lora_alpha"] / ((acfg["r"] ** 0.5) if acfg.get("use_rslora") else acfg["r"])
   hf_to_tg = {v: k for k, v in hf_sources(tc).items()}
   weights = nn.state.safe_load(adapter / "adapter_model.safetensors")
   merged = 0
@@ -225,14 +229,13 @@ def load(run:str, max_context:int=8192, dtype:dtypes.DType=dtypes.float16, devic
   run_dir, meta = resolve(run)
   base_dir = resolve_base(meta)
   cfg = json.loads((base_dir / "config.json").read_text())
-  tc = text_config(cfg)
+  tc, prefix = text_config(cfg), BASE_PREFIX
   if meta.get("weights", "lora") == "full":
     # a full checkpoint carries its own text config and shards; the 27B is published this way
     cfg = json.loads((run_dir / "config.json").read_text())
-    tc = text_config(cfg)
-    base_dir = run_dir
+    tc, prefix, base_dir = text_config(cfg), "", run_dir
   model = Transformer(transformer_config(tc, max_context))
-  sd = base_state_dict(base_dir, tc)
+  sd = base_state_dict(base_dir, tc, prefix)
   if meta.get("weights", "lora") == "lora":
     if (n := merge_lora(sd, run_dir, tc, device)) == 0: raise ValueError(f"{run_dir} has no LoRA tensors")
   # tie the (unused) LM head to the embeddings so strict loading works without a second 500 MB copy

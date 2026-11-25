@@ -19,10 +19,10 @@ class Kev:
   def __init__(self, loaded:Loaded, device:str|None=None):
     self.loaded = loaded
     self.model = loaded.model
-    self.head = loaded.meta["head"]
+    self.device = device or Tensor.empty(0).device
+    self.head = {k: v.to(self.device) for k, v in loaded.meta["head"].items()}
     self.temperature = float(loaded.meta.get("temperature", 1.0))
     self.head_dim = int(loaded.meta.get("head_dim", 256))
-    self.device = device or Tensor.empty(0).device
 
   def hidden(self, ids:list[int]) -> Tensor:
     """`[len(ids), hidden]` final-norm hidden states of one causal row."""
