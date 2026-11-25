@@ -215,6 +215,65 @@ def merge_lora(sd:dict[str, Tensor], adapter:pathlib.Path, tc:dict, device:str) 
     merged += 1
   return merged
 
+class _FusedFFN:
+  """`FFNBlock` with the gate and up projections fused into one GEMM (Kev's fused_qwen35 does the same on CUDA)."""
+  def _feed_forward(self, x:Tensor, tokens:Tensor|None=None) -> Tensor:
+    from tinygrad.llm.model import gated_activation
+    gu = self._gate_up(x)
+    hd = self.config.hidden_dim
+    return self.ffn_down(gated_activation(gu[..., :hd], gu[..., hd:], self.config))
+
+def fuse_mlp(model) -> int:
+  """Concatenate `ffn_gate`/`ffn_up` weights and route the block through a single projection."""
+  classes:dict[type, type] = {}
+  n = 0
+  for blk in model.blk:
+    if not (hasattr(blk, "ffn_gate") and hasattr(blk, "ffn_up")) or hasattr(blk, "_gate_up"): continue
+    if getattr(blk.config, "num_experts", 0): continue
+    base = type(blk)
+    if base not in classes:
+      classes[base] = type(f"Fused{base.__name__}", (_FusedFFN, base), {})
+    blk._gate_up = nn.Linear(blk.ffn_gate.weight.shape[1], blk.ffn_gate.weight.shape[0] + blk.ffn_up.weight.shape[0], bias=False)
+    blk._gate_up.weight = Tensor.cat(blk.ffn_gate.weight, blk.ffn_up.weight, dim=0).contiguous().realize()
+    blk.__class__ = classes[base]
+    n += 1
+  return n
+
+def _install_transposed_linear() -> None:
+  """Route `nn.Linear` through a pre-transposed weight (contiguous [in, out]) when one is present.
+
+  tinygrad's `x.linear(w.transpose())` reads the B operand with a transposed stride; a materialized copy lets
+  the Metal tensor-core schedule coalesce it (measured up to 2x on the Kev GEMM shapes)."""
+  if getattr(nn.Linear, "_tinykev_t", False): return
+  orig = nn.Linear.__call__
+  def call(self, x):
+    return x.linear(self._weight_t, self.bias) if getattr(self, "_weight_t", None) is not None else orig(self, x)
+  nn.Linear.__call__ = call
+  nn.Linear._tinykev_t = True
+
+def transpose_linears(model, skip:tuple[str, ...]=("output",)) -> int:
+  """Materialize `weight.T` for every Linear in `model` (except `skip`) and free the original."""
+  _install_transposed_linear()
+  seen:set[int] = set()
+  def walk(obj, name:str) -> int:
+    if isinstance(obj, Tensor) or id(obj) in seen: return 0
+    seen.add(id(obj))
+    if isinstance(obj, nn.Linear):
+      if not hasattr(obj, "_weight_t"):
+        obj._weight_t = obj.weight.T.contiguous().realize()
+        if hasattr(obj, "use_custom_quant"): obj.use_custom_quant = False   # tinygrad.llm.model.Linear GGUF path
+        return 1
+      return 0
+    n = 0
+    if isinstance(obj, (list, tuple)):
+      for v in obj: n += walk(v, name)
+    elif hasattr(obj, "__dict__"):
+      for k, v in vars(obj).items():
+        if k in skip: continue
+        n += walk(v, k)
+    return n
+  return walk(model, "model")
+
 @dataclass
 class Loaded:
   model:Transformer
@@ -247,4 +306,6 @@ def load(run:str, max_context:int=8192, dtype:dtypes.DType=dtypes.float16, devic
   nn.state.load_state_dict(model, sd, verbose=False, consume=True, realize=False)
   Tensor.realize(*nn.state.get_parameters(model))
   del sd
+  if os.environ.get("TINYKEV_WT", "0") != "0": transpose_linears(model)
+  if os.environ.get("TINYKEV_FUSE_MLP", "0") != "0": fuse_mlp(model)
   return Loaded(model, meta, tc, run_dir)

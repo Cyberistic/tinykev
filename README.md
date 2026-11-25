@@ -25,7 +25,8 @@ Working end to end on Metal with `jaredpalmer/kev-0.8b`:
 * fp32 hidden states vs HF `transformers` 5.24 on the same inputs: **max |diff| 0.06, mean 0.0055** (reference
   activations have mean |x| ≈ 1.69), and question probabilities agree to **≈1e-3**;
 * fp16 weights reproduce fp32 probabilities to **<2e-4**;
-* the readout is a templated **UIR kernel**, generated the same way `slopkernels` generates its AMD kernels.
+* the readout **and the Gated DeltaNet scan** are templated UIR kernels in the `slopkernels` style; with Metal tensor
+  cores, row batching and `TinyJit`, one 101-token request went from **5.9 s to ~0.09 s** (64x).
 
 The 4B/9B adapters and the 27B full-weight checkpoint use the same code paths but have not been run here.
 
@@ -37,25 +38,36 @@ Kev-0.8B, one request: 22-token state, 3 questions, 101 tokens total, steady sta
 | backend | per request |
 |---|---|
 | MLX, cached state prefix (`probs_with_prefix`) | **48 ms** |
+| MLX, row form (`forward_rows`, same algorithm as tinykev) | **60 ms** |
 | MLX, serving path (`probs`: state once + branch rows) | **71 ms** |
-| MLX, row form (same algorithm as tinykev, `forward_rows`) | **60 ms** |
-| tinykev, Metal fp16, `--jit` | **0.97 s** |
-| tinykev, Metal fp16, default | **5.9 s** |
+| tinykev, Metal fp16, state cache warm (`TINYKEV_PREFIX=1`) | **77 ms** |
+| tinykev, Metal fp16, full rows (default) | **~90 ms** (85-95 ms across runs) |
 | torch fp32 CPU (the exact path Kev's published numbers use) | **13.5 s** |
 
 ```bash
-PYTHONPATH=vendor/tinygrad:. python scripts/bench.py --run jaredpalmer/kev-0.8b --max-context 1024 --iters 10 --jit
+PYTHONPATH=vendor/tinygrad:. python scripts/bench.py --run jaredpalmer/kev-0.8b --max-context 1024 --iters 10
+TINYKEV_PREFIX=1 PYTHONPATH=vendor/tinygrad:. python scripts/bench.py --run jaredpalmer/kev-0.8b --max-context 1024
 ```
 
-`--jit` wraps each row length in `TinyJit`, so the DeltaNet graph is built and compiled once per shape and replayed.
-That is why it is ~6x faster for repeated requests; a single one-shot call pays the capture instead (worse than the
-default), so the CLI leaves it off unless asked.
+What moved the needle, in order:
 
-The remaining ~14x gap to MLX is kernel count, not math: tinygrad's Gated DeltaNet fallback is a Python loop over
-tokens inside each of the 18 DeltaNet layers, which turns one request into thousands of small kernel launches, while
-MLX's chunked delta rule does one pass per layer. The fix is a **chunked gated-delta UIR kernel** — `slopkernels`'
-`gated_delta_prefill` has the shape of it, but its warp reduction uses the AMD `ds_swizzle` intrinsic and needs a
-Metal-friendly reduction to be portable.
+| change | effect |
+|---|---|
+| portable UIR gated-delta scan + TinyJit replay | 5.9 s -> 1.1 s |
+| `TC_OPT=2` (tinygrad's Metal tensor cores are off by default outside BEAM) | 1.1 s -> 114 ms |
+| one padded batch for all question rows | 114 -> 93 ms |
+| `TinyJit(prune=True)` | ~5 % |
+| state-prefix cache (`TINYKEV_PREFIX=1`, Kev's serving form) | 93 -> 77 ms warm |
+
+The default keeps `TINYKEV_PREFIX=0` because a first request is faster as one full row batch (85-95 ms) than as
+state pass + branch pass (~100 ms); `TINYKEV_PREFIX=1` is the better choice for a serving loop.
+
+**We are not yet ahead of MLX.** The same-algorithm gap (93 vs 60 ms) is tinygrad's generic Metal GEMM schedule: both
+run 192 padded token-positions, MLX reaches ~3.5 TFLOPS of the model's ~210 GFLOP while tinygrad reaches ~2.3.
+`TC_OPT=2` already turns on `simdgroup` WMMA for the big projections; the remaining 1.5x is tiling. Attempts that did
+not pay off on Metal: `BEAM=2` (16 min compile, then `AGX: exceeded compiled variants footprint limit`), fusing the
+MLP gate/up (2.7x slower), fusing weights into a transposed layout (neutral), bf16 weights (7 % slower), and the
+`TC_SELECT`/`TC_MIN_GLOBALS` variants (all worse than the default).
 
 ## Quick start
 
@@ -149,6 +161,15 @@ The kernel fuses the gather of the option rows against the projected query and t
 not AMD-specific — it is ordinary tinygrad IR and runs on Metal/CPU too. `TINYKEV_UIR=0` forces the Tensor-op path,
 which is the fallback if the kernel cannot be built.
 
+`tinykev/gated_delta.py` is the bigger one: it is `slopkernels`' `gated_delta_prefill` layout with the AMD
+`ds_swizzle` warp reduce replaced by a real WARP-axis reduce, which tinygrad lowers to a local buffer and a
+cross-thread reduction (barriers included). One program per (batch, head, 4 value rows); 32 lanes split the key
+dimension and each lane holds 4 state values of each row in registers; the token loop is a serial LOOP range and the
+two dot products per token are `REDUCE` over the UPCAST key lane then the WARP lane. The hook is deliberately narrow:
+`PortableGatedDeltaNetBlock._attention` lets tinygrad's existing `amd_gated_delta` branch run on Metal for the
+duration of the call and routes only that kernel name to the portable one, so the conv, gates, norm and layouts are
+still tinygrad's. `TINYKEV_DELTA_UIR=0` restores the unrolled fallback.
+
 ## Validation
 
 `scripts/parity_hf.py` loads the same checkpoint twice — tinykev and HF `transformers` + a manually merged adapter —
@@ -173,12 +194,15 @@ reference; probabilities are unaffected at this scale.
 
 ## Limitations / next steps
 
-* **No prefix cache reuse.** Each question recomputes the state row (`kev.forward_rows_batch`'s exact form). Kev's
-  serving path runs the state once and copies the recurrent/KV cache per question; tinygrad's blocks write caches in
-  place, so that needs an explicit snapshot/restore.
-* **Metal compiles the DeltaNet scan unrolled.** Rule-of-thumb on this repo's tinygrad: one Python-level step per token
-  per DeltaNet layer. Long states are slow to compile. The natural next UIR kernel is a chunked gated-delta prefill
-  (the shape of `slopkernels/src/amd.py::_gated_delta_prefill_kernel`), which would make 4k+ token states practical.
+* **GEMM tiling is the wall.** The portable UIR kernels removed the scan and readout bottlenecks, but the projections
+  still go through tinygrad's generic Metal schedule (~2.3 TFLOPS vs MLX's ~3.5). A hand-scheduled WMMA GEMM (or a
+  fused DeltaNet layer) is the next step; `TC_OPT=2` already emits `simdgroup` code, so this is tiling, not a missing
+  instruction.
+* **State-prefix reuse is opt-in** (`TINYKEV_PREFIX=1`). It keeps separate stable cache buffers for the state pass
+  (B=1) and the branch pass (B=3), both `TinyJit`-captured, and copies the state into the branch buffers per request.
+  The padded branch batch (M=126) is less GEMM-efficient than the full 192-position batch, so it only wins warm.
+* Long states still compile one conv/norm graph per shape; the token loop is gone from the recurrence, so compile time
+  no longer scales with state length the way it did before the scan kernel.
 * `option_isolation` is not implemented: it needs the packed block-causal mask, which hybrid backbones cannot use.
 * Full-weight checkpoints (`meta.weights == "full"`, the 27B) share the loader but were not exercised.
 * No HTTP server/streaming; the CLI mirrors the `/v1/systemone` response shape.

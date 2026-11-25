@@ -14,7 +14,8 @@ def main(argv:list[str]|None=None) -> int:
   p.add_argument("--request", help="@path to a full /v1/systemone request JSON")
   p.add_argument("--max-context", type=int, default=8192, help="KV cache size; at least the longest state+branch row")
   p.add_argument("--device", default=None)
-  p.add_argument("--jit", action="store_true", help="replay row shapes through TinyJit (better for many requests)")
+  p.add_argument("--no-jit", dest="jit", action="store_false", help="rebuild the graph every request (default: JIT replay)")
+  p.set_defaults(jit=True)
   args = p.parse_args(argv)
 
   if args.request:

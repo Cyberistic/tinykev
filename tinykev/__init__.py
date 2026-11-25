@@ -11,8 +11,15 @@ print(to_answers(kev.probs(enc), meta_q))
 """
 from __future__ import annotations
 
+import os
+# tensor cores are off by default outside BEAM; the whole port depends on them (3-4x on Metal)
+os.environ.setdefault("TC_OPT", "2")
+
 import json
 from pathlib import Path
+
+from tinygrad.helpers import TC_OPT as _TC_OPT
+if int(_TC_OPT.value) == 0: _TC_OPT.value = 2
 
 from .encode import ContextOverflow, encode, rows_of, to_answers, to_record
 from .model import Kev
