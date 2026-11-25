@@ -132,6 +132,22 @@ class PortableGatedDeltaNetBlock(GatedDeltaNetBlock):
 
   def _attention(self, x, start_pos, idx_mask=None):
     import tinygrad.llm.model as M
+    from . import fused_delta as FD
+    if FD.enabled() and not self.config.ssm.kda and isinstance(start_pos[0], int) and x.dtype is dtypes.float16 \
+        and self.head_k_dim % 32 == 0 and (self.head_v_dim // ROW_TILE) * ROW_TILE == self.head_v_dim:
+      B, T, _ = x.shape
+      xh = x.half()
+      H, V, K = self.num_v_heads, self.head_v_dim, self.head_k_dim
+      out_gate = self.attn_gate(xh).reshape(B, T, H, V)
+      beta = self.ssm_beta(xh).sigmoid().reshape(B, T, H).float()
+      alpha = (self.ssm_alpha(xh).float() + self.ssm_dt["bias"]).reshape(B, T, H, 1)
+      alpha_exp = (alpha.softplus() * self.ssm_a.reshape(self.num_v_heads, -1)).transpose(1, 2).exp().reshape(B, H, T)
+      proj = self.attn_qkv(xh)
+      initial = start_pos[0] == 0
+      core = FD.core(proj, self.ssm_conv1d["weight"], self.conv_state, beta, alpha_exp, self.recurrent_state, initial)
+      if initial: self.conv_state.assign(proj[:, T-3:T].cast(self.conv_state.dtype))
+      z = (self.ssm_norm(core.transpose(1, 2)) * out_gate.silu()).cast(x.dtype).contiguous()
+      return self.ssm_out(z.reshape(B, T, -1))
     if getattr(self, "_proj", None) is not None and not self.config.ssm.kda:
       # one [T,1024] x [1024, 8224] GEMM instead of qkv + gate + beta + alpha (kev.fused_qwen35 does this on CUDA).
       # N=8224 tiles far better on Metal than N=6144: ~3.4 vs ~1.6 TFLOPS in isolation.
