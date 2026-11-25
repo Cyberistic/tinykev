@@ -118,11 +118,6 @@ def get_gated_delta() -> UOp:
 
 # ---- hook into tinygrad's existing DeltaNet kernel call ----
 
-class _Stash:
-  """Stand-in projection: returns its slice of a projection already computed for the whole block."""
-  def __init__(self, t:UOp, a:int, b:int): self.t, self.a, self.b = t, a, b
-  def __call__(self, _x): return self.t[..., self.a:self.b]
-
 class PortableGatedDeltaNetBlock(GatedDeltaNetBlock):
   """`GatedDeltaNetBlock` that runs its scan through the portable UIR kernel.
 
@@ -130,69 +125,11 @@ class PortableGatedDeltaNetBlock(GatedDeltaNetBlock):
   guard.  For the duration of that call we let the guard pass and route only that kernel name to the portable
   UIR kernel; every other `_amd_target` user (flash attention, etc.) stays off on non-AMD devices."""
 
-  def _epilogue_attention(self, x, start_pos):
-    """Non-KDA DeltaNet with the fused gated-norm epilogue (conv + our scan + one elementwise kernel)."""
-    from .epilogue import enabled as epi_enabled, epilogue
-    from . import conv as C
-    if not epi_enabled() or self.config.ssm.kda or not isinstance(start_pos[0], int) or x.dtype is not dtypes.float16 \
-        or self.head_k_dim % 32 or self.head_v_dim % 32: return None
-    B, T, _ = x.shape; H, V, K = self.num_v_heads, self.head_v_dim, self.head_k_dim; T_pad = x.max_shape[1]
-    xh = x.half()
-    out_gate = self.attn_gate(xh).reshape(B, T, H, V)
-    beta = self.ssm_beta(xh).sigmoid().reshape(B, T, H)
-    alpha = (self.ssm_alpha(xh).float() + self.ssm_dt["bias"]).reshape(B, T, H, 1)
-    log_alpha = alpha.softplus() * self.ssm_a.reshape(H, -1)
-    proj = self.attn_qkv(xh)
-    conv_out, store = C.short_conv(self.conv_state, proj, self.ssm_conv1d["weight"].flatten(1), Tensor(start_pos[0]).eq(0))
-    state_dep = Tensor(self.recurrent_state.uop.after(store))
-    q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
-    q, k = (z.reshape(B, T_pad, self.num_k_heads, K) for z in (q, k))
-    q, k = ((z.rmsnorm(eps=1e-6/K) / (K**0.5)).repeat(1, 1, H // self.num_k_heads, 1) for z in (q, k))
-    v = v.reshape(B, T_pad, H, V)
-    q, k, v, bt = (z.transpose(1, 2).float() for z in (q, k, v, beta))
-    q = q * K**-0.5
-    alpha_in = log_alpha.transpose(1, 2).exp().reshape(B, H, T_pad, 1)
-    kq = (q * k).sum(-1).contiguous()
-    kern = get_gated_delta().specialize(**kernel_params(batch=B, heads=H, tokens=T_pad,
-                                                       v_tiles=self.head_v_dim // 4, k_blks=K // 32, alpha_k=1))
-    out = UOp.alloc((B, H, T_pad, V), dtypes.float32, device=proj.device)
-    core = Tensor(out.after(kern.call(out, q.contiguous().uop, k.contiguous().uop, v.contiguous().uop, bt.contiguous().uop,
-                                     alpha_in.contiguous().uop, state_dep.uop, kq.uop, UOp.const(start_pos[0], dtypes.weakint))))
-    z = epilogue(core, out_gate, self.ssm_norm.weight, self.config.norm_eps)
-    return None if z is None else self.ssm_out(z)
-
   def _attention(self, x, start_pos, idx_mask=None):
     import tinygrad.llm.model as M
-    from . import fused_delta as FD
     if (pk := getattr(self, "_pack", None)) is not None and not self.config.ssm.kda:
       from .packed import delta_attention
       return delta_attention(self, x, pk)
-    if (epi := self._epilogue_attention(x, start_pos)) is not None: return epi
-    if FD.enabled() and not self.config.ssm.kda and isinstance(start_pos[0], int) and x.dtype is dtypes.float16 \
-        and self.head_k_dim % 32 == 0 and (self.head_v_dim // ROW_TILE) * ROW_TILE == self.head_v_dim:
-      B, T, _ = x.shape
-      xh = x.half()
-      H, V, K = self.num_v_heads, self.head_v_dim, self.head_k_dim
-      out_gate = self.attn_gate(xh).reshape(B, T, H, V)
-      beta = self.ssm_beta(xh).sigmoid().reshape(B, T, H).float()
-      alpha = (self.ssm_alpha(xh).float() + self.ssm_dt["bias"]).reshape(B, T, H, 1)
-      alpha_exp = (alpha.softplus() * self.ssm_a.reshape(self.num_v_heads, -1)).transpose(1, 2).exp().reshape(B, H, T)
-      proj = self.attn_qkv(xh)
-      initial = start_pos[0] == 0
-      core = FD.core(proj, self.ssm_conv1d["weight"], self.conv_state, beta, alpha_exp, self.recurrent_state, initial)
-      if initial: self.conv_state.assign(proj[:, T-3:T].cast(self.conv_state.dtype))
-      z = (self.ssm_norm(core.transpose(1, 2)) * out_gate.silu()).cast(x.dtype).contiguous()
-      return self.ssm_out(z.reshape(B, T, -1))
-    if getattr(self, "_proj", None) is not None and not self.config.ssm.kda:
-      # one [T,1024] x [1024, 8224] GEMM instead of qkv + gate + beta + alpha (kev.fused_qwen35 does this on CUDA).
-      # N=8224 tiles far better on Metal than N=6144: ~3.4 vs ~1.6 TFLOPS in isolation.
-      a, b, c = self._proj_ends
-      p = self._proj(x.half())
-      saved = (self.attn_qkv, self.attn_gate, self.ssm_beta, self.ssm_alpha)
-      self.attn_qkv, self.attn_gate, self.ssm_beta, self.ssm_alpha = (_Stash(p, 0, a), _Stash(p, a, b),
-                                                                      _Stash(p, b, c), _Stash(p, c, p.shape[-1]))
-      try: return super()._attention(x, start_pos, idx_mask)
-      finally: self.attn_qkv, self.attn_gate, self.ssm_beta, self.ssm_alpha = saved
     if enabled() and _is_metal(x.device):
       from . import conv as C
       old_target, old_get, old_conv = M._amd_target, M._get_kernel, M.short_conv

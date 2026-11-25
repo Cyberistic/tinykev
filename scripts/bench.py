@@ -2,9 +2,7 @@
 
     PYTHONPATH=vendor/tinygrad:. python scripts/bench.py --run jaredpalmer/kev-0.8b --iters 10
 
-By default the port runs the packed form (every token once; rows only inside the sequence mixers, see
-`tinykev/packed.py`); `TINYKEV_PACKED=0` selects the row form (each question is `state + branch`). Compare with `kev.probs`
-(prefix path) on the reference backend, and with `kev.forward_rows` for the same algorithm.
+Uses the packed form (`tinykev/packed.py`); `TINYKEV_PACKED=0` selects the padded row form.
 """
 from __future__ import annotations
 
@@ -33,7 +31,6 @@ def main():
   p.add_argument("--warmup", type=int, default=2)
   p.add_argument("--dtype", choices=["f16", "f32"], default="f16")
   p.add_argument("--no-jit", dest="jit", action="store_false", help="rebuild the graph every request (default: JIT replay)")
-  p.add_argument("--cold", action="store_true", help="drop the cached state prefix before every request")
   p.set_defaults(jit=True)
   args = p.parse_args()
 
@@ -52,7 +49,6 @@ def main():
   for _ in range(args.warmup): kev.probs(enc)
   times = []
   for _ in range(args.iters):
-    if args.cold: kev.clear_prefix()
     t = time.perf_counter(); probs = kev.probs(enc); times.append(time.perf_counter() - t)
   times.sort()
   print(f"per request: min {times[0]*1000:.1f} ms  median {statistics.median(times)*1000:.1f} ms  "

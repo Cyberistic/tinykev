@@ -21,36 +21,18 @@ UIR_DIR = pathlib.Path(__file__).resolve().parent / "uir"
 TILES = {(1024, 6144): (4, 4, 4), (1024, 3584): (4, 2, 4), (3584, 1024): (2, 2, 4), (1024, 2048): (4, 2, 8),
          (2048, 1024): (4, 2, 4), (1024, 512): (3, 2, 8), (1024, 4096): (4, 4, 2), (1024, 16): (4, 2, 1)}
 
-# warm-path (M=126) tiles for the kernels the GPU profile puts on top: qkv, MLP gate/up, MLP down
-MTILES = {(126, 1024, 6144): (4, 8, 8), (126, 1024, 3584): (4, 4, 2), (126, 3584, 1024): (2, 2, 4)}
-USE_MTILES = os.environ.get("TINYKEV_GEMM_MTILES", "1") != "0"
-
-OVERRIDE = os.environ.get("TINYKEV_GEMM_TILE")   # "nu,nl", for sweeping
-
 def _plan(M:int, K:int, N:int) -> tuple[int, int, int]|None:
   base, (mu, nu, nl) = -(-M // 8), TILES.get((K, N), (4, 4, 4))
-  if USE_MTILES and (M, K, N) in MTILES: mu, nu, nl = MTILES[(M, K, N)]
-  if OVERRIDE: nu, nl = (int(x) for x in OVERRIDE.split(","))
   if base % mu: mu = next((m for m in (4, 3, 2) if base % m == 0), None)
   if mu is None: return None
   if N % (8 * nu * nl):
     nu, nl = next(((a, b) for a, b in ((4, 4), (2, 4), (4, 2), (2, 2), (2, 8), (8, 2)) if N % (8 * a * b) == 0), (0, 0))
   return None if nu == 0 else (mu, nu, nl)
 
-def _m_up(M:int) -> int|None:
-  """The M upcast the TC-split M range divides; measured best-first (M=192 -> 4, M=144 -> 3)."""
-  base = -(-M // 8)   # the TC pads M up to its fragment
-  for mu in (4, 3, 2):
-    if base % mu == 0: return mu
-  return None
-
-K_SPLIT = int(os.environ.get("TINYKEV_GEMM_KSPLIT", "0"))   # 0/1 disables; 2-4 splits the reduce axis
-
 def _opts(mu:int, nu:int, nl:int) -> tuple[Opt, ...]:
   base = (Opt(OptOps.TC, 0, (-1, 2, 1)), Opt(OptOps.SPLIT, 0, (mu, AxisType.UPCAST)),
           Opt(OptOps.SPLIT, 1, (nu, AxisType.UPCAST)))
-  if nl > 1: base += (Opt(OptOps.SPLIT, 1, (nl, AxisType.LOCAL)),)
-  return base + ((Opt(OptOps.SPLIT, 2, (K_SPLIT, AxisType.UPCAST)),) if K_SPLIT > 1 else ())
+  return base + ((Opt(OptOps.SPLIT, 1, (nl, AxisType.LOCAL)),) if nl > 1 else ())
 
 def _build(M:int, K:int, N:int) -> UOp:
   out, a, w = (UOp.param(0, dtypes.float16, (M, N)), UOp.param(1, dtypes.float16, (M, K)),
@@ -84,7 +66,6 @@ def matmul(x:Tensor, w:Tensor) -> Tensor|None:
   # state pass) is not divisible by the M upcast; both fall back to tinygrad's schedule
   plan = _plan(M, K, N)
   if M < 32 or K == 0 or N == 0 or plan is None: return None
-  if K_SPLIT > 1 and K % (8 * K_SPLIT) != 0: return None
   try: kern = get_gemm(M, K, N)
   except Exception: return None
   out = UOp.alloc((M, N), dtypes.float16, device=x.device)
