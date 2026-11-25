@@ -21,10 +21,15 @@ UIR_DIR = pathlib.Path(__file__).resolve().parent / "uir"
 TILES = {(1024, 6144): (4, 4, 4), (1024, 3584): (4, 2, 4), (3584, 1024): (2, 2, 4), (1024, 2048): (4, 2, 8),
          (2048, 1024): (4, 2, 4), (1024, 512): (3, 2, 8), (1024, 4096): (4, 4, 2), (1024, 16): (4, 2, 1)}
 
+# warm-path (M=126) tiles for the kernels the GPU profile puts on top: qkv, MLP gate/up, MLP down
+MTILES = {(126, 1024, 6144): (4, 8, 8), (126, 1024, 3584): (4, 4, 2), (126, 3584, 1024): (2, 2, 4)}
+USE_MTILES = os.environ.get("TINYKEV_GEMM_MTILES", "1") != "0"
+
 OVERRIDE = os.environ.get("TINYKEV_GEMM_TILE")   # "nu,nl", for sweeping
 
 def _plan(M:int, K:int, N:int) -> tuple[int, int, int]|None:
   base, (mu, nu, nl) = -(-M // 8), TILES.get((K, N), (4, 4, 4))
+  if USE_MTILES and (M, K, N) in MTILES: mu, nu, nl = MTILES[(M, K, N)]
   if OVERRIDE: nu, nl = (int(x) for x in OVERRIDE.split(","))
   if base % mu: mu = next((m for m in (4, 3, 2) if base % m == 0), None)
   if mu is None: return None
