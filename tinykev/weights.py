@@ -215,6 +215,52 @@ def merge_lora(sd:dict[str, Tensor], adapter:pathlib.Path, tc:dict, device:str) 
     merged += 1
   return merged
 
+def fuse_delta_proj(model:Transformer) -> int:
+  """Concatenate each non-KDA DeltaNet block's qkv/gate/beta/alpha projections into one GEMM."""
+  from tinygrad.llm.model import Linear
+  n = 0
+  for blk in model.blk:
+    if not hasattr(blk, "attn_qkv") or hasattr(blk, "_proj") or getattr(blk.config.ssm, "kda", False): continue
+    ws = (blk.attn_qkv.weight, blk.attn_gate.weight, blk.ssm_beta.weight, blk.ssm_alpha.weight)
+    lin = Linear(ws[0].shape[1], sum(w.shape[0] for w in ws), bias=False)
+    lin.weight = Tensor.cat(*ws, dim=0).contiguous().realize()
+    ends, total = [], 0
+    for w in ws[:-1]:
+      total += w.shape[0]
+      ends.append(total)
+    blk._proj, blk._proj_ends = lin, tuple(ends)
+    n += 1
+  return n
+
+def fuse_attn_qkv(model:Transformer) -> int:
+  """Concatenate each full-attention block's q/k/v projections into one GEMM."""
+  from tinygrad.llm.model import Linear, TransformerBlock
+  n = 0
+  for blk in model.blk:
+    if not isinstance(blk, TransformerBlock) or hasattr(blk, "_qkv"): continue
+    if blk.attn_q.bias is not None or blk.attn_k.bias is not None or blk.attn_v.bias is not None: continue
+    ws = (blk.attn_q.weight, blk.attn_k.weight, blk.attn_v.weight)
+    lin = Linear(ws[0].shape[1], sum(w.shape[0] for w in ws), bias=False)
+    lin.weight = Tensor.cat(*ws, dim=0).contiguous().realize()
+    blk._qkv = lin
+    blk._qkv_ends = (ws[0].shape[0], ws[0].shape[0] + ws[1].shape[0])
+    n += 1
+  return n
+
+def prepare_linears(model:Transformer) -> int:
+  """Pre-transpose f16 Linear weights to `[K, N]` so Metal WMMA loads both A and W coalesced."""
+  from tinygrad.llm.model import Linear
+  n = 0
+  for blk in model.blk:
+    for name in ("_proj", "_qkv", "ssm_out", "attn_output", "ffn_gate", "ffn_up", "ffn_down",
+                 "attn_qkv", "attn_gate", "attn_q", "attn_k", "attn_v"):
+      lin = getattr(blk, name, None)
+      if isinstance(lin, Linear) and lin.bias is None and getattr(lin, "groups", 1) == 1 \
+          and getattr(lin, "weight", None) is not None and lin.weight.dtype is dtypes.float16 and not hasattr(lin, "_weight_t"):
+        lin._weight_t = lin.weight.T.contiguous().realize()
+        n += 1
+  return n
+
 @dataclass
 class Loaded:
   model:Transformer

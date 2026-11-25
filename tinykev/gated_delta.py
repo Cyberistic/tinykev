@@ -13,7 +13,7 @@ It plugs into tinygrad's existing call site (the `amd_gated_delta` branch of `Ga
 """
 from __future__ import annotations
 
-import functools, os, pathlib, threading
+import functools, math, os, pathlib, threading
 from dataclasses import replace
 
 from tinygrad import Context, Tensor, UOp, dtypes
@@ -26,6 +26,7 @@ from tinygrad.uop.uir import parse_uir, render_uir
 UIR_DIR = pathlib.Path(__file__).resolve().parent / "uir"
 ROW_TILE = int(os.environ.get("TINYKEV_ROW_TILE", "8"))   # value rows per program (must divide head_v_dim)
 NATIVE_WARP = os.environ.get("TINYKEV_WARP_NATIVE", "1") != "0"
+SIMD_SUM = os.environ.get("TINYKEV_SIMD_SUM", "1") != "0"
 # Kev's row form always starts at position 0 (or restores the state from a snapshot), so the final recurrent
 # state is never read back.  Skipping its 128x128 store saves ~25 MB of writes per layer.
 WRITE_STATE = os.environ.get("TINYKEV_SCAN_STATE", "0") != "0"
@@ -41,6 +42,7 @@ def _warp_sum(v:UOp) -> UOp:
   if v.op is Ops.REDUCE or any(u.op is Ops.REDUCE for u in v.src):
     tmp = UOp.alloc((1,), dtypes.float32, addrspace=AddrSpace.REG)
     v = tmp.after(tmp[0].store(v))[0].load()
+  if SIMD_SUM: return UOp.native("simd_sum({0})", shape=v.shape, dtype=dtypes.float32, fmt=True).call(v).reshape(())
   for off in (16, 8, 4, 2, 1):
     sh = UOp.native(f"simd_shuffle_xor({{0}}, {off})", shape=v.shape, dtype=dtypes.int32, fmt=True)
     v = v + sh.call(v.bitcast(dtypes.int32)).bitcast(dtypes.float32)
@@ -104,6 +106,70 @@ def _build_gated_delta() -> UOp:
   return state[b, h, row_base + r_out, col].store(reg.after(step)[r_out, ci].load()).end(ci, r_out, lane, bh_row).sink(
     arg=KernelInfo(name="gated_delta_portable", opts_to_apply=()))
 
+def _build_gated_delta_packed() -> UOp:
+  """The same recurrence over the packed token order, with the branch state kept in registers.
+
+  A packed request is `state + branch_0 + ... + branch_{R-1}`, so the state prefix is the same for every
+  question.  The row form re-scans it once per row (192 padded token steps for 101 real tokens); here one
+  program per (head, value-row tile) walks the packed order exactly once, copies the state into a second
+  register block at the `save` flag (the last prefix token) and selects it back in at every `restore` flag
+  (each branch's first token) -- a register move, no state traffic.
+
+  The flags are data, so one compiled kernel serves every request of the same (heads, tokens, K, V) shape.
+  """
+  heads, tokens, K, V, KB, VT, alpha_k = (_t("heads"), _t("tokens"), _t("K", 32, 4096), _t("V", 4, 4096),
+                                          _t("KB", 1, 128), _t("VT", 1, 1024), _t("alpha_k"))
+  row_tile = ROW_TILE
+  out, q, k, v = (_p(0, (heads, tokens, V), dtypes.float32), _p(1, (heads, tokens, K), dtypes.float32),
+                  _p(2, (heads, tokens, K), dtypes.float32), _p(3, (heads, tokens, V), dtypes.float32))
+  beta, alpha = _p(4, (heads, tokens), dtypes.float32), _p(5, (heads, tokens, alpha_k), dtypes.float32)
+  kq, flags = _p(6, (heads, tokens), dtypes.float32), _p(7, (tokens,), dtypes.int32)
+
+  h_row = UOp.range(heads * VT, 0, AxisType.GLOBAL)
+  h, row_base = h_row // VT, (h_row % VT) * row_tile
+  ci, lane = UOp.range(KB, 4, AxisType.UPCAST), UOp.range(32, 1, AxisType.WARP)
+  col = lane + ci * 32
+  reg = UOp.alloc((row_tile, KB), dtypes.float32, addrspace=AddrSpace.REG)      # the running state
+  saved = UOp.alloc((row_tile, KB), dtypes.float32, addrspace=AddrSpace.REG)    # the state at the save flag
+  cur = UOp.alloc((row_tile, KB), dtypes.float32, addrspace=AddrSpace.REG)      # restored state for this token
+  r_init = UOp.range(row_tile, 3, AxisType.UPCAST)
+  reg = reg.after(reg[r_init, ci].store(0.0).end(ci, r_init))
+  saved = saved.after(saved[r_init, ci].store(0.0).end(ci, r_init))
+
+  token = UOp.range(tokens, 2)
+  prev, saved_prev, flag = reg.after(token), saved.after(token), flags[token].load()
+  cur = cur.after(cur[r_init, ci].store(flag.eq(2).where(saved_prev[r_init, ci].load(), prev[r_init, ci].load()))
+                  .end(ci, r_init))
+  kv, qv = k[h, token, col].load(), q[h, token, col].load()
+  av, bv, kqv = alpha[h, token, col % alpha_k].load(), beta[h, token].load(), kq[h, token].load()
+  stores = []
+  for r_i in range(row_tile):
+    row = row_base + r_i
+    decayed = cur[r_i, ci].load() * av
+    state_k = _warp_sum((decayed * kv).reduce(ci, arg=(Ops.ADD, 0)))
+    state_q = _warp_sum((decayed * qv).reduce(ci, arg=(Ops.ADD, 0)))
+    delta = (v[h, token, row].load() - state_k) * bv
+    new = decayed + delta * kv
+    stores += [out[h, token, row.valid(lane.eq(0))].store(state_q + delta * kqv),
+               reg[r_i, ci].store(new).end(ci),
+               saved[r_i, ci].store(flag.eq(1).where(new, saved_prev[r_i, ci].load())).end(ci)]
+  return UOp.group(*stores).end(token, lane, h_row).sink(arg=KernelInfo(name="gated_delta_packed", opts_to_apply=()))
+
+@functools.cache
+def get_gated_delta_packed() -> UOp:
+  """Generate `tinykev/uir/gated_delta_packed.uir` (packed order, register state save/restore)."""
+  UIR_DIR.mkdir(parents=True, exist_ok=True)
+  with Context(SPEC=0):
+    u = graph_rewrite(_build_gated_delta_packed(), symbolic_simple, enter_calls=True)
+    uir = render_uir(u, color=False)
+  dst = UIR_DIR / "gated_delta_packed.uir"
+  tmp = dst.with_name(f".{dst.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+  tmp.write_text(uir + "\n", encoding="utf-8"); os.replace(tmp, dst)
+  return parse_uir(uir)
+
+def packed_kernel_params(heads:int, tokens:int, k_blks:int, v_tiles:int, alpha_k:int) -> dict:
+  return dict(heads=heads, tokens=tokens, K=k_blks*32, V=v_tiles*4, KB=k_blks, VT=v_tiles*4 // ROW_TILE, alpha_k=alpha_k)
+
 @functools.cache
 def get_gated_delta() -> UOp:
   """Generate `tinykev/uir/gated_delta_portable.uir` fresh and return the parsed templated UOp."""
@@ -143,6 +209,11 @@ class PortableGatedDeltaNetBlock(GatedDeltaNetBlock):
       try: return super()._attention(x, start_pos, idx_mask)
       finally: M._amd_target, M._get_kernel, M.short_conv = old_target, old_get, old_conv
     return super()._attention(x, start_pos, idx_mask)
+
+  def _feed_forward(self, x, tokens=None):
+    from .packed import feed_forward
+    if (out := feed_forward(self, x, tokens)) is not None: return out
+    return super()._feed_forward(x, tokens)
 
 def _is_metal(device) -> bool:
   d = device if isinstance(device, str) else (device[0] if isinstance(device, tuple) and device else None)

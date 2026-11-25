@@ -1,18 +1,16 @@
 # tinykev
 
-Runs [Kev](https://github.com/jaredpalmer/kev) decision models on [tinygrad](https://github.com/tinygrad/tinygrad). There's no torch at runtime. The scan, short conv, GEMMs, gathers and readout are hand-written Metal UIR kernels, and every request is replayed through `TinyJit`. Each token is computed once, in packed order. Only the conv, scan and attention see per-question rows.
+Runs [Kev](https://github.com/jaredpalmer/kev) decision models on [tinygrad](https://github.com/tinygrad/tinygrad) with no torch at runtime, using packed-sequence Metal UIR kernels (WMMA/Split-K GEMMs, SwiGLU, chunked WY Gated DeltaNet, Flash Attention, fused RMSNorm) replayed via `TinyJit`.
 
-Kev-0.8B, 101-token request, Apple Silicon, fp16, medians:
+Kev-0.8B (101 tokens, M2 Pro, fp16, 20-iter medians):
 
-| backend | ms |
+|Backend|ms|
 |---|---|
-| **tinykev (Metal)** | **TBD** |
-| Kev MLX, cached prefix | 45.5 |
-| Kev MLX, row form | 58.0 |
-| Kev MLX, serving `probs` | 67.1 |
+|**tinykev (Metal)**|**25.6** (min 24.9)|
+|Kev MLX, cached prefix|45.5|
+|Kev MLX, row form|58.0|
+|Kev MLX, serving `probs`|67.1|
 
 ```bash
-git clone --recurse-submodules <repo> && cd tinykev && export PYTHONPATH=vendor/tinygrad:.
-python scripts/bench.py --run jaredpalmer/kev-0.8b --max-context 1024
-python -m unittest discover -s tinykev/test
+PYTHONPATH=vendor/tinygrad:. python scripts/bench.py --run jaredpalmer/kev-0.8b --iters 20
 ```

@@ -9,23 +9,27 @@ right-padded into one batch -- Kev's `forward_rows_batch`.
 """
 from __future__ import annotations
 
-import math, os
+import array, math, os
 
-from tinygrad import Tensor, TinyJit, dtypes
+from tinygrad import Device, Tensor, TinyJit, dtypes
 
 from .encode import rows_of
-from .weights import Loaded
+from .weights import Loaded, fuse_attn_qkv, fuse_delta_proj, prepare_linears
 
 class Kev:
   def __init__(self, loaded:Loaded, device:str|None=None, use_jit:bool=False):
     self.loaded, self.model, self.use_jit = loaded, loaded.model, use_jit
     self.device = device or Tensor.empty(0).device
     self._jits:dict[tuple, TinyJit] = {}
+    self._in_bufs:dict[tuple, list[tuple[Tensor, object]]] = {}
     self._cache_sets:dict[int, list] = {}   # per-batch recurrent/KV cache buffers (row form)
     from .gemm import install as install_gemm
     from .gated_delta import enabled as delta_uir_enabled, install as install_delta_uir
     from .packed import enabled as packed_enabled, install as install_packed
     install_gemm()
+    fuse_delta_proj(self.model)
+    fuse_attn_qkv(self.model)
+    prepare_linears(self.model)
     if delta_uir_enabled(): install_delta_uir(self.model)
     install_packed(self.model)
     self.use_packed = packed_enabled()
@@ -90,14 +94,20 @@ class Kev:
 
   # ---- packed form ----
 
-  def _packed_logits(self, ids:Tensor, rows_idx:Tensor, pack_idx:Tensor, decide:Tensor, opts:Tensor, owner:Tensor,
-                     R:int, L:int, N:int) -> Tensor:
+  def _packed_logits(self, ids:Tensor, rows_idx:Tensor, pack_idx:Tensor, flags:Tensor, conv_src:Tensor,
+                     chunk_tok:Tensor, chunk_flags:Tensor, tok_row:Tensor, tok_pos:Tensor, q_tiles:Tensor,
+                     decide:Tensor, opts:Tensor, owner:Tensor, R:int, L:int, N:int) -> Tensor:
     from .gather import gather_rows
-    from .packed import Pack, set_pack
+    from .packed import Pack, forward_packed, set_pack
     from .uir import readout
-    set_pack(self.model, Pack(R, L, N, rows_idx, pack_idx))
-    try: h = self._hidden(ids)[0]
-    finally: set_pack(self.model, None)
+    pk = Pack(R, L, N, rows_idx, pack_idx, flags, conv_src, chunk_tok, chunk_flags, tok_row, tok_pos, q_tiles)
+    cfg = self.model.config
+    if cfg.hc is None and not cfg.attn_res_block_size and not any(hasattr(b, "ple") for b in self.model.blk):
+      h = forward_packed(self.model, ids, pk)
+    else:
+      set_pack(self.model, pk)
+      try: h = self._hidden(ids)[0]
+      finally: set_pack(self.model, None)
     qw, qb, kw, kb = self.head["q.weight"], self.head["q.bias"], self.head["k.weight"], self.head["k.bias"]
     q = gather_rows(h, decide).float() @ qw.T + qb
     k = gather_rows(h, opts).float() @ kw.T + kb
@@ -105,17 +115,47 @@ class Kev:
     z = z * (1.0 / math.sqrt(qw.shape[0]))
     return (z if self.temperature == 1.0 else z / self.temperature).contiguous()
 
+  def _pack_inputs(self, key:tuple, lay:dict) -> list[Tensor]:
+    """Reuse pre-allocated unified-memory int32 input buffers per shape key to avoid per-request MTLBuffer churn."""
+    R, L, N, NC = lay["R"], lay["L"], lay["N"], lay["NC"]
+    specs = (
+      ((1, N), lay["ids"]),
+      ((R * L,), lay["rows_idx"]),
+      ((N,), lay["pack_idx"]),
+      ((N,), lay["flags"]),
+      ((N, 3), [x for row in lay["conv_src"] for x in row]),
+      ((NC, len(lay["chunk_tok"][0])), [x for row in lay["chunk_tok"] for x in row]),
+      ((NC,), lay["chunk_flags"]),
+      ((N,), lay["tok_row"]),
+      ((N,), lay["tok_pos"]),
+      ((lay["NT"], 3), [x for row in lay["q_tiles"] for x in row]),
+      ((len(lay["decide"]),), lay["decide"]),
+      ((len(lay["opts"]),), lay["opts"]),
+      ((len(lay["owner"]),), lay["owner"]),
+    )
+    if (cached := self._in_bufs.get(key)) is None:
+      bufs = [Tensor.zeros(*sh, dtype=dtypes.int32, device=self.device).contiguous() for sh, _ in specs]
+      Tensor.realize(*bufs)
+      Device[self.device].synchronize()
+      views = [t.uop.buffer.ensure_allocated().host for t in bufs]
+      if all(v is not None for v in views):
+        cached = [(t, v.view(fmt="i")) for t, v in zip(bufs, views)]
+        self._in_bufs[key] = cached
+      else:
+        return [Tensor(vals, dtype=dtypes.int32, device=self.device).reshape(*sh) for sh, vals in specs]
+    for (t, mv), (_, vals) in zip(cached, specs):
+      mv[:] = array.array("i", vals)
+    return [t for t, _ in cached]
+
   def logits_packed(self, enc:dict) -> list[list[float]]:
     """One logits list per question, every token computed once; one JIT per (rows, row length, packed length) shape."""
-    from .packed import layout, prepare
+    from .packed import layout
     lay = layout(enc)
     R, L, N = lay["R"], lay["L"], lay["N"]
-    prepare(self.model, R, self.device)
-    args = [Tensor([lay["ids"]], dtype=dtypes.int32, device=self.device)] + \
-           [Tensor(lay[k], dtype=dtypes.int32, device=self.device) for k in ("rows_idx", "pack_idx", "decide", "opts", "owner")]
+    key = ("packed", R, L, N, lay["NC"], lay["NT"], len(lay["opts"]))
+    args = self._pack_inputs(key, lay)
     fn = lambda *a: self._packed_logits(*a, R=R, L=L, N=N)
     if self.use_jit:
-      key = ("packed", R, L, N, len(lay["opts"]))
       if (jit := self._jits.get(key)) is None: jit = self._jits.setdefault(key, TinyJit(fn, prune=True))
       z = jit(*args)
     else: z = fn(*args)

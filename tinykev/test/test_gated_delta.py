@@ -6,7 +6,8 @@ import unittest
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.uop.uir import parse_uir, render_uir
 
-from tinykev.gated_delta import ROW_TILE, UIR_DIR, WRITE_STATE, get_gated_delta, kernel_params
+from tinykev.gated_delta import (ROW_TILE, UIR_DIR, WRITE_STATE, get_gated_delta, get_gated_delta_packed,
+                                 kernel_params, packed_kernel_params)
 
 def _reference(q, k, v, beta, alpha, state):
   B, H, T, _ = q.shape
@@ -32,6 +33,23 @@ class TestPortableGatedDelta(unittest.TestCase):
     p = UIR_DIR / "gated_delta_portable.uir"
     self.assertTrue(p.exists())
     self.assertEqual(render_uir(parse_uir(p.read_text()), color=False).strip(), render_uir(u, color=False).strip())
+
+  def test_packed_save_restore(self):
+    from tinykev.packed import _scan_ref
+    H, T, K, V = 2, 12, 32, 8
+    q, k = Tensor.randn(H,T,K).realize(), Tensor.randn(H,T,K).realize()
+    v = Tensor.randn(H,T,V).realize()
+    beta, alpha = Tensor.rand(H,T).realize(), Tensor.rand(H,T,1).realize()*0.5+0.5
+    # Four prefix tokens, then two branches and three padded steps. Each branch must restart from the prefix state.
+    flags = Tensor([0,0,0,1, 2,0,0, 2,0, 0,0,0], dtype=dtypes.int32).realize()
+    kq = (q*k).sum(-1).realize()
+    kern = get_gated_delta_packed().specialize(**packed_kernel_params(heads=H, tokens=T, k_blks=K//32,
+                                                                     v_tiles=V//4, alpha_k=1))
+    out = UOp.alloc((H,T,V), dtypes.float32, device=q.device)
+    got = Tensor(out.after(kern.call(out, q.uop, k.uop, v.uop, beta.uop, alpha.uop, kq.uop, flags.uop))).realize()
+    ref = _scan_ref(q, k, v, beta, alpha, flags).realize()
+    diff = max(abs(a-b) for a, b in zip(got.flatten().tolist(), ref.flatten().tolist()))
+    self.assertLess(diff, 1e-2)
 
   def test_matches_recurrence(self):
     for T, K, V in ((1, 32, 8), (5, 32, 8), (4, 128, 128)):
