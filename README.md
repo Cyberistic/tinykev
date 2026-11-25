@@ -1,6 +1,12 @@
 # tinykev
 
-Runs [Kev](https://github.com/jaredpalmer/kev) decision models on [tinygrad](https://github.com/tinygrad/tinygrad) without torch, using packed-sequence Metal UIR kernels (WMMA/Split-K GEMMs, SwiGLU, chunked WY DeltaNet, Flash Attention, fused RMSNorm, readout pruning, cached prefix) via `TinyJit`.
+Runs [Kev](https://github.com/jaredpalmer/kev) (open-source jev) decision models on [tinygrad](https://github.com/tinygrad/tinygrad) at 3x the speed on a macbook (metal).
+It's faster than my keystrokes and costs very little memory, like ~20ms fast. 
+so fast you can make it type-check everything you write or auto sort your downloads folder
+how is it so fast??? im so excited
+what? 
+vroom vroom tinykevvvvvrooooom kachawww
+
 
 Kev-0.8B (101 tokens, M2 Pro, fp16, 20-iter medians):
 
@@ -15,3 +21,5 @@ Kev-0.8B (101 tokens, M2 Pro, fp16, 20-iter medians):
 ```bash
 PYTHONPATH=vendor/tinygrad:. python scripts/bench.py --run jaredpalmer/kev-0.8b --iters 20 --cached-prefix
 ```
+
+license: MIT 
