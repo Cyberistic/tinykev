@@ -41,8 +41,98 @@ class Pack:
   tok_row: Tensor     # (N,) owning row index (0..R-1) of each packed token
   tok_pos: Tensor     # (N,) causal position (0..L-1) of each packed token inside its row
   q_tiles: Tensor|None = None  # (NT, 3) [row_r, q_start, q_len] non-overlapping tiles for WMMA Flash Attention
+  ro_idx: Tensor|None = None   # (M_ro,) padded readout packed indices (`decide + opts`) for last-layer pruning
+  ro_row: Tensor|None = None   # (M_ro,) owning row of each readout token
+  ro_pos: Tensor|None = None   # (M_ro,) causal position of each readout token
+
+@dataclass
+class PrefixState:
+  S: int                     # number of cached state tokens
+  state_ids: tuple[int, ...] # token ids that produced this prefix state
+  # per-layer state: DeltaNet -> (conv_state (3, qa) f16, recurrent_state (H, V, K) f16)
+  #                  Attention -> (k_prefix (S, nkv, hd) f16, v_prefix (S, nkv*hd) f16)
+  layers: tuple[tuple[Tensor, Tensor], ...]
+
+  @property
+  def tensors(self) -> tuple[Tensor, ...]:
+    return tuple(t for pair in self.layers for t in pair)
 
 def _ceil(x:int, a:int) -> int: return -(-x // a) * a
+
+def layout_prefix(state_ids:list[int]) -> dict:
+  """Host-side index tables for running the state prefix alone (`S` tokens) to build a `PrefixState`."""
+  S = len(state_ids)
+  assert S > 0, "prefix must have at least 1 token"
+  L = _ceil(S, ROW_ALIGN)
+  N = max(_ceil(S, ALIGN), 32)
+  rows_idx = list(range(S)) + [S - 1] * (L - S)
+  pack_idx = [t if t < S else 0 for t in range(N)]
+  tok_row = [0] * N
+  tok_pos = [t if t < S else 0 for t in range(N)]
+  flags = [0] * N
+  flags[S - 1] = 1
+  conv_src = [[N, N, N] for _ in range(N)]
+  for t in range(S):
+    for j in range(3):
+      if t >= 3 - j: conv_src[t][j] = t - 3 + j
+  from .chunked_delta import make_chunks
+  from .flash_attn import make_q_tiles
+  chunk_tok, chunk_flags = make_chunks(S, [], N)
+  q_tiles = make_q_tiles(S, [[]], L)
+  return {"ids": list(state_ids) + [0] * (N - S), "S": S, "R": 1, "L": L, "N": N,
+          "NC": len(chunk_tok), "NT": len(q_tiles), "rows_idx": rows_idx, "pack_idx": pack_idx,
+          "flags": flags, "conv_src": conv_src, "chunk_tok": chunk_tok, "chunk_flags": chunk_flags,
+          "tok_row": tok_row, "tok_pos": tok_pos, "q_tiles": q_tiles}
+
+def layout_branches(enc:dict, S:int) -> dict:
+  """Host-side index tables for branch-only packed inference given a cached `S`-token state prefix."""
+  seg, n = enc["seg"], len(enc["ids"])
+  assert seg.count(0) == S, f"prefix length mismatch: expected {S}, got {seg.count(0)}"
+  n_b = n - S
+  branches, start = [], S
+  for d in enc["decide_idx"]:
+    branches.append(list(range(start - S, d + 1 - S))); start = d + 1
+  R = len(branches)
+  L = _ceil(max(S + len(b) for b in branches), ROW_ALIGN)
+  N_b = max(_ceil(n_b, ALIGN), 32)
+  rows_idx, pack_idx, tok_row, tok_pos = [], [0] * N_b, [0] * N_b, [0] * N_b
+  for r, b in enumerate(branches):
+    # Attention KV table has [0..S-1] from prefix, [S..S+N_b-1] from branches
+    row_kv = list(range(S)) + [S + pb for pb in b]
+    for tb, pb in enumerate(b):
+      pack_idx[pb] = r * L + S + tb
+      tok_row[pb] = r
+      tok_pos[pb] = S + tb
+    rows_idx += row_kv + [row_kv[-1]] * (L - len(row_kv))
+  decide = [d - S for d in enc["decide_idx"]]
+  opts = [o - S for oi in enc["opt_idx"] for o in oi]
+  owner = [q for q, oi in enumerate(enc["opt_idx"]) for _ in oi]
+  flags = [0] * N_b
+  for b in branches:
+    if b: flags[b[0]] = 2
+  # conv_src: 0..N_b-1 -> branch token, N_b..N_b+2 -> prefix conv_state[0..2], N_b+3 -> zero
+  conv_src = [[N_b + 3, N_b + 3, N_b + 3] for _ in range(N_b)]
+  for b in branches:
+    for tb, pb in enumerate(b):
+      for j in range(3):
+        off = tb - 3 + j
+        if off >= 0: conv_src[pb][j] = b[off]
+        elif S + off >= 0: conv_src[pb][j] = N_b + 3 + off
+  from .chunked_delta import make_chunks
+  from .flash_attn import make_q_tiles
+  chunk_tok, chunk_flags = make_chunks(0, branches, N_b)
+  q_tiles = make_q_tiles(S, branches, L, prefix_cached=True)
+  ro_raw = decide + opts
+  M_ro = max(_ceil(len(ro_raw), ALIGN), ALIGN)
+  ro_idx = ro_raw + [0] * (M_ro - len(ro_raw))
+  ro_row = [tok_row[pb] for pb in ro_idx]
+  ro_pos = [tok_pos[pb] for pb in ro_idx]
+  return {"ids": enc["ids"][S:] + [0] * (N_b - n_b), "S": S, "R": R, "L": L, "N": N_b,
+          "NC": len(chunk_tok), "NT": len(q_tiles), "M_ro": M_ro,
+          "rows_idx": rows_idx, "pack_idx": pack_idx, "flags": flags, "conv_src": conv_src,
+          "chunk_tok": chunk_tok, "chunk_flags": chunk_flags, "tok_row": tok_row, "tok_pos": tok_pos,
+          "q_tiles": q_tiles, "ro_idx": ro_idx, "ro_row": ro_row, "ro_pos": ro_pos,
+          "decide": decide, "opts": opts, "owner": owner}
 
 def layout(enc:dict) -> dict:
   """Host-side index tables for one packed encoding (lists, turned into Tensors by the caller)."""
@@ -82,10 +172,17 @@ def layout(enc:dict) -> dict:
   from .flash_attn import make_q_tiles
   chunk_tok, chunk_flags = make_chunks(S, branches, N)
   q_tiles = make_q_tiles(S, branches, L)
+  decide = list(enc["decide_idx"])
+  ro_raw = decide + opts
+  M_ro = max(_ceil(len(ro_raw), ALIGN), ALIGN)
+  ro_idx = ro_raw + [0] * (M_ro - len(ro_raw))
+  ro_row = [tok_row[p] for p in ro_idx]
+  ro_pos = [tok_pos[p] for p in ro_idx]
   return {"ids": enc["ids"] + [0] * (N - n), "R": R, "L": L, "N": N, "NC": len(chunk_tok), "NT": len(q_tiles),
-          "rows_idx": rows_idx, "pack_idx": pack_idx, "flags": flags, "conv_src": conv_src,
+          "M_ro": M_ro, "rows_idx": rows_idx, "pack_idx": pack_idx, "flags": flags, "conv_src": conv_src,
           "chunk_tok": chunk_tok, "chunk_flags": chunk_flags, "tok_row": tok_row, "tok_pos": tok_pos,
-          "q_tiles": q_tiles, "decide": list(enc["decide_idx"]), "opts": opts, "owner": owner}
+          "q_tiles": q_tiles, "ro_idx": ro_idx, "ro_row": ro_row, "ro_pos": ro_pos,
+          "decide": decide, "opts": opts, "owner": owner}
 
 def to_rows(x:Tensor, pk:Pack) -> Tensor:
   """(N, C) packed -> (R, L, C) rows."""
@@ -102,7 +199,9 @@ def _out_proj(lin, x:Tensor, splitk:bool) -> Tensor:
     if (parts := matmul_t_splitk(x, wt)) is not None: return parts
   return lin(x)
 
-def delta_attention(blk, x:Tensor, pk:Pack, splitk:bool=False) -> Tensor:
+def delta_attention(blk, x:Tensor, pk:Pack, splitk:bool=False,
+                    conv_prefix:Tensor|None=None, init_state:Tensor|None=None,
+                    return_state:int=0) -> Tensor|tuple[Tensor, Tensor, Tensor]:
   """`GatedDeltaNetBlock._attention` (non-KDA) on a packed sequence."""
   from . import conv as C
   cfg = blk.config.ssm
@@ -112,7 +211,15 @@ def delta_attention(blk, x:Tensor, pk:Pack, splitk:bool=False) -> Tensor:
   p = blk._proj(xh)                                                   # qkv | gate | beta | alpha, one GEMM
   qa, qb, qc = blk._proj_ends
   from .chunked_delta import fused_delta_core
-  if (core := fused_delta_core(blk, p, pk.chunk_tok, pk.chunk_flags, pk.conv_src)) is None:
+  saved_state = None
+  res = fused_delta_core(blk, p, pk.chunk_tok, pk.chunk_flags, pk.conv_src,
+                         conv_prefix=conv_prefix, init_state=init_state, return_state=return_state > 0)
+  if res is not None:
+    if return_state > 0: core, saved_state = res
+    else: core = res
+  else:
+    if conv_prefix is not None or init_state is not None or return_state > 0:
+      raise RuntimeError("cached prefix requires Metal fp16 chunked DeltaNet")
     beta = p[..., qb:qc].float().sigmoid().reshape(N, H)
     g = (p[..., qc:].float() + blk.ssm_dt["bias"]).reshape(N, H)
     a = blk.ssm_a.reshape(H)
@@ -128,11 +235,19 @@ def delta_attention(blk, x:Tensor, pk:Pack, splitk:bool=False) -> Tensor:
     core = _delta_core(q, k, v, beta.transpose(0, 1), log_alpha.transpose(0, 1).exp().reshape(H, N, 1), pk)
   from .rmsnorm import gated_rmsnorm
   if (z := gated_rmsnorm(core, p, blk.ssm_norm.weight, qa, blk.config.norm_eps, cfg.silu_gate)) is not None:
-    return _out_proj(blk.ssm_out, z.reshape(1, N, -1), splitk)
-  out_gate = p[..., qa:qb].reshape(N, H, V)
-  core = core.transpose(0, 1)                                         # (N, H, V)
-  z = (blk.ssm_norm(core) * (out_gate.silu() if cfg.silu_gate else out_gate.sigmoid())).cast(x.dtype)
-  return _out_proj(blk.ssm_out, z.reshape(1, N, -1), splitk)
+    out = _out_proj(blk.ssm_out, z.reshape(1, N, -1), splitk)
+  else:
+    out_gate = p[..., qa:qb].reshape(N, H, V)
+    core = core.transpose(0, 1)                                       # (N, H, V)
+    z = (blk.ssm_norm(core) * (out_gate.silu() if cfg.silu_gate else out_gate.sigmoid())).cast(x.dtype)
+    out = _out_proj(blk.ssm_out, z.reshape(1, N, -1), splitk)
+  if return_state > 0:
+    p2 = p.reshape(N, -1)
+    S = return_state
+    if S >= 3: conv_st = p2[S - 3 : S, :qa].contiguous()
+    else: conv_st = Tensor.zeros(3 - S, qa, dtype=p2.dtype, device=p2.device).cat(p2[:S, :qa], dim=0).contiguous()
+    return out, conv_st, saved_state
+  return out
 
 def _conv(blk, proj:Tensor, pk:Pack, C) -> Tensor:
   """The 4-tap causal conv, in packed order but with each token's window taken from its own row."""
@@ -169,7 +284,9 @@ def _scan_ref(q, k, v, beta, alpha, flags:Tensor) -> Tensor:
     outs.append((state * q[:, t].unsqueeze(-2)).sum(-1))
   return outs[0].stack(*outs[1:], dim=1)
 
-def attention(blk, x:Tensor, pk:Pack, splitk:bool=False) -> Tensor:
+def attention(blk, x:Tensor, pk:Pack, splitk:bool=False,
+              k_prefix:Tensor|None=None, v_prefix:Tensor|None=None,
+              return_kv:int=0) -> Tensor|tuple[Tensor, Tensor, Tensor]:
   """`TransformerBlock._attention` on a packed sequence (each row is causal from position 0)."""
   cfg = blk.config
   N, R, L, nh, nkv, hd = pk.N, pk.R, pk.L, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
@@ -177,8 +294,14 @@ def attention(blk, x:Tensor, pk:Pack, splitk:bool=False) -> Tensor:
     a, b = blk._qkv_ends
     p = qkv_lin(x)
     from .flash_attn import packed_attention
-    if (out := packed_attention(blk, p, pk)) is not None:
-      return _out_proj(blk.attn_output, out.reshape(1, N, nh * hd), splitk)
+    res = packed_attention(blk, p, pk, k_prefix=k_prefix, v_prefix=v_prefix, return_kv=return_kv)
+    if res is not None:
+      if return_kv > 0:
+        out, k_st, v_st = res
+        return _out_proj(blk.attn_output, out.reshape(1, N, nh * hd), splitk), k_st, v_st
+      return _out_proj(blk.attn_output, res.reshape(1, N, nh * hd), splitk)
+    if k_prefix is not None or return_kv > 0:
+      raise RuntimeError("cached prefix requires Metal fp16 packed Flash Attention")
     q, k, v = p[..., :a], p[..., a:b], p[..., b:]
   else:
     q, k, v = blk.attn_q(x), blk.attn_k(x), blk.attn_v(x)
@@ -223,20 +346,80 @@ def install(model) -> None:
     if type(blk) is TransformerBlock: blk.__class__ = PackedTransformerBlock
     elif type(blk) is GatedDeltaNetBlock: blk.__class__ = PortableGatedDeltaNetBlock
 
-def forward_packed(model, ids:Tensor, pk:Pack) -> Tensor:
-  """Walk the backbone in packed order `(N, D)` fusing every residual add (and Split-K reduction) with the next RMSNorm."""
+def _attention_readout(blk, h_all:Tensor, h_ro:Tensor, pk:Pack, splitk:bool,
+                       k_prefix:Tensor|None=None, v_prefix:Tensor|None=None) -> Tensor|None:
+  """Exact lossless final-layer attention: K/V on all `N` tokens, Q/attention/output only on `M_ro` readout tokens."""
+  kv_t, qt = getattr(blk, "_kv_t", None), getattr(blk.attn_q, "_weight_t", None)
+  if kv_t is None or qt is None or pk.ro_pos is None or pk.ro_row is None: return None
+  from .flash_attn import packed_attention_readout
+  from .gemm import matmul_t
+  if (kv_all := matmul_t(h_all, kv_t)) is None: return None
+  if (q_ro := matmul_t(h_ro, qt)) is None: return None
+  if (out_ro := packed_attention_readout(blk, q_ro, kv_all, pk, k_prefix=k_prefix, v_prefix=v_prefix)) is None: return None
+  return _out_proj(blk.attn_output, out_ro.reshape(1, h_ro.shape[0], -1), splitk)
+
+def forward_prefix(model, ids:Tensor, pk:Pack, S:int) -> tuple[tuple[Tensor, Tensor], ...]:
+  """Run the backbone on a shared state prefix (`S` tokens) and capture per-layer DeltaNet + KV cache states."""
+  from tinygrad.llm.model import GatedDeltaNetBlock
+  from .rmsnorm import add_rmsnorm, rmsnorm
+  eps = model.config.norm_eps
+  x = model.token_embd(ids)[0]
+  blks = model.blk
+  h = rmsnorm(x, blks[0].attn_norm.weight, eps)
+  states: list[tuple[Tensor, Tensor]] = []
+  last_i = len(blks) - 1
+  for i, blk in enumerate(blks):
+    if isinstance(blk, TransformerBlock):
+      if not hasattr(blk, "freqs_cis"): blk._init_state(h.unsqueeze(0))
+      attn_out, k_st, v_st = attention(blk, h.unsqueeze(0), pk, splitk=True, return_kv=S)
+      states.append((k_st, v_st))
+    elif isinstance(blk, GatedDeltaNetBlock) and not blk.config.ssm.kda:
+      attn_out, conv_st, rec_st = delta_attention(blk, h.unsqueeze(0), pk, splitk=True, return_state=S)
+      states.append((conv_st, rec_st))
+    else:
+      raise RuntimeError(f"cached prefix does not support block {type(blk).__name__}")
+    if i == last_i: break   # final layer only needs its KV/recurrent state; output hidden states aren't read
+    if attn_out.ndim == 3 and attn_out.shape[0] == 1: attn_out = attn_out[0]
+    x, h = add_rmsnorm(x, attn_out, blk.ffn_norm.weight, eps)
+    if (ffn_out := feed_forward(blk, h.unsqueeze(0), splitk=True)) is None: ffn_out = blk._feed_forward(h.unsqueeze(0), ids)
+    if ffn_out.ndim == 3 and ffn_out.shape[0] == 1: ffn_out = ffn_out[0]
+    x, h = add_rmsnorm(x, ffn_out, blks[i + 1].attn_norm.weight, eps)
+  return tuple(states)
+
+def forward_packed(model, ids:Tensor, pk:Pack, readout_only:bool=False,
+                   prefix_layers:tuple[tuple[Tensor, Tensor], ...]|None=None) -> tuple[Tensor, bool]:
+  """Walk the backbone in packed order `(N, D)` fusing every residual add (and Split-K reduction) with the next RMSNorm.
+
+  When `readout_only=True` and the final block is a fused full-attention block with `M_ro < N`, prunes the
+  final layer to compute only the `M_ro` readout tokens (`decide + opts`) — 100% lossless.  Returns `(h, pruned)`."""
   from tinygrad.llm.model import GatedDeltaNetBlock
   from .rmsnorm import add_rmsnorm, rmsnorm
   eps = model.config.norm_eps
   x = model.token_embd(ids)[0]                                        # (N, D)
   blks = model.blk
   h = rmsnorm(x, blks[0].attn_norm.weight, eps)
+  last_i = len(blks) - 1
   for i, blk in enumerate(blks):
+    pst = prefix_layers[i] if prefix_layers is not None else None
+    if i == last_i and readout_only and pk.ro_idx is not None and pk.ro_idx.shape[0] < pk.N \
+        and isinstance(blk, TransformerBlock) and hasattr(blk, "_kv_t"):
+      if not hasattr(blk, "freqs_cis"): blk._init_state(h.unsqueeze(0))
+      x_ro, h_ro = gather_rows(x, pk.ro_idx), gather_rows(h, pk.ro_idx)
+      kp, vp = pst if pst is not None else (None, None)
+      if (attn_ro := _attention_readout(blk, h, h_ro, pk, splitk=True, k_prefix=kp, v_prefix=vp)) is not None:
+        if attn_ro.ndim == 3 and attn_ro.shape[0] == 1: attn_ro = attn_ro[0]
+        x_ro, h_ro = add_rmsnorm(x_ro, attn_ro, blk.ffn_norm.weight, eps)
+        if (ffn_ro := feed_forward(blk, h_ro.unsqueeze(0), splitk=True)) is None: ffn_ro = blk._feed_forward(h_ro.unsqueeze(0), ids)
+        if ffn_ro.ndim == 3 and ffn_ro.shape[0] == 1: ffn_ro = ffn_ro[0]
+        _, h_ro = add_rmsnorm(x_ro, ffn_ro, model.output_norm.weight, eps)
+        return h_ro, True
     if isinstance(blk, TransformerBlock):
       if not hasattr(blk, "freqs_cis"): blk._init_state(h.unsqueeze(0))
-      attn_out = attention(blk, h.unsqueeze(0), pk, splitk=True)
+      kp, vp = pst if pst is not None else (None, None)
+      attn_out = attention(blk, h.unsqueeze(0), pk, splitk=True, k_prefix=kp, v_prefix=vp)
     elif isinstance(blk, GatedDeltaNetBlock) and not blk.config.ssm.kda:
-      attn_out = delta_attention(blk, h.unsqueeze(0), pk, splitk=True)
+      cp, sp = pst if pst is not None else (None, None)
+      attn_out = delta_attention(blk, h.unsqueeze(0), pk, splitk=True, conv_prefix=cp, init_state=sp)
     else:
       # fallback to generic block call for unsupported layer types
       set_pack(model, pk)
@@ -251,7 +434,7 @@ def forward_packed(model, ids:Tensor, pk:Pack) -> Tensor:
     if ffn_out.ndim == 3 and ffn_out.shape[0] == 1: ffn_out = ffn_out[0]
     nxt_w = blks[i + 1].attn_norm.weight if i + 1 < len(blks) else model.output_norm.weight
     x, h = add_rmsnorm(x, ffn_out, nxt_w, eps)
-  return h
+  return h, False
 
 def set_pack(model, pk:Pack|None) -> None:
   for blk in model.blk: blk._pack = pk

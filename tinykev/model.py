@@ -96,28 +96,37 @@ class Kev:
 
   def _packed_logits(self, ids:Tensor, rows_idx:Tensor, pack_idx:Tensor, flags:Tensor, conv_src:Tensor,
                      chunk_tok:Tensor, chunk_flags:Tensor, tok_row:Tensor, tok_pos:Tensor, q_tiles:Tensor,
-                     decide:Tensor, opts:Tensor, owner:Tensor, R:int, L:int, N:int) -> Tensor:
+                     ro_idx:Tensor, ro_row:Tensor, ro_pos:Tensor,
+                     decide:Tensor, opts:Tensor, owner:Tensor, *prefix_flat:Tensor,
+                     R:int, L:int, N:int, n_decide:int, n_opts:int) -> Tensor:
     from .gather import gather_rows
     from .packed import Pack, forward_packed, set_pack
     from .uir import readout
-    pk = Pack(R, L, N, rows_idx, pack_idx, flags, conv_src, chunk_tok, chunk_flags, tok_row, tok_pos, q_tiles)
+    pk = Pack(R, L, N, rows_idx, pack_idx, flags, conv_src, chunk_tok, chunk_flags, tok_row, tok_pos, q_tiles,
+              ro_idx, ro_row, ro_pos)
+    prefix_layers = tuple((prefix_flat[i], prefix_flat[i + 1]) for i in range(0, len(prefix_flat), 2)) if prefix_flat else None
     cfg = self.model.config
-    if cfg.hc is None and not cfg.attn_res_block_size and not any(hasattr(b, "ple") for b in self.model.blk):
-      h = forward_packed(self.model, ids, pk)
+    pruned = False
+    if prefix_layers is not None or (cfg.hc is None and not cfg.attn_res_block_size and not any(hasattr(b, "ple") for b in self.model.blk)):
+      h, pruned = forward_packed(self.model, ids, pk, readout_only=True, prefix_layers=prefix_layers)
     else:
       set_pack(self.model, pk)
       try: h = self._hidden(ids)[0]
       finally: set_pack(self.model, None)
     qw, qb, kw, kb = self.head["q.weight"], self.head["q.bias"], self.head["k.weight"], self.head["k.bias"]
-    q = gather_rows(h, decide).float() @ qw.T + qb
-    k = gather_rows(h, opts).float() @ kw.T + kb
+    if pruned:
+      q = h[:n_decide].float() @ qw.T + qb
+      k = h[n_decide:n_decide + n_opts].float() @ kw.T + kb
+    else:
+      q = gather_rows(h, decide).float() @ qw.T + qb
+      k = gather_rows(h, opts).float() @ kw.T + kb
     if (z := readout(q.contiguous(), k.contiguous(), owner)) is None: z = (k * q[owner]).sum(-1)
     z = z * (1.0 / math.sqrt(qw.shape[0]))
     return (z if self.temperature == 1.0 else z / self.temperature).contiguous()
 
   def _pack_inputs(self, key:tuple, lay:dict) -> list[Tensor]:
     """Reuse pre-allocated unified-memory int32 input buffers per shape key to avoid per-request MTLBuffer churn."""
-    R, L, N, NC = lay["R"], lay["L"], lay["N"], lay["NC"]
+    R, L, N, NC, M_ro = lay["R"], lay["L"], lay["N"], lay["NC"], lay["M_ro"]
     specs = (
       ((1, N), lay["ids"]),
       ((R * L,), lay["rows_idx"]),
@@ -129,6 +138,9 @@ class Kev:
       ((N,), lay["tok_row"]),
       ((N,), lay["tok_pos"]),
       ((lay["NT"], 3), [x for row in lay["q_tiles"] for x in row]),
+      ((M_ro,), lay["ro_idx"]),
+      ((M_ro,), lay["ro_row"]),
+      ((M_ro,), lay["ro_pos"]),
       ((len(lay["decide"]),), lay["decide"]),
       ((len(lay["opts"]),), lay["opts"]),
       ((len(lay["owner"]),), lay["owner"]),
@@ -152,9 +164,10 @@ class Kev:
     from .packed import layout
     lay = layout(enc)
     R, L, N = lay["R"], lay["L"], lay["N"]
-    key = ("packed", R, L, N, lay["NC"], lay["NT"], len(lay["opts"]))
+    n_decide, n_opts = len(lay["decide"]), len(lay["opts"])
+    key = ("packed", R, L, N, lay["NC"], lay["NT"], lay["M_ro"], n_opts)
     args = self._pack_inputs(key, lay)
-    fn = lambda *a: self._packed_logits(*a, R=R, L=L, N=N)
+    fn = lambda *a: self._packed_logits(*a, R=R, L=L, N=N, n_decide=n_decide, n_opts=n_opts)
     if self.use_jit:
       if (jit := self._jits.get(key)) is None: jit = self._jits.setdefault(key, TinyJit(fn, prune=True))
       z = jit(*args)
@@ -162,6 +175,43 @@ class Kev:
     flat, out, i = z.tolist(), [], 0
     for oi in enc["opt_idx"]:
       out.append(flat[i:i+len(oi)]); i += len(oi)
+    return out
+
+  def cache_prefix(self, state_ids:list[int]):
+    """Run the backbone once on a shared state prefix and return a reusable `PrefixState` (DeltaNet + KV cache)."""
+    from .packed import Pack, PrefixState, forward_prefix, layout_prefix
+    lay = layout_prefix(state_ids)
+    S, R, L, N = lay["S"], lay["R"], lay["L"], lay["N"]
+    t = lambda v, sh: Tensor(v, dtype=dtypes.int32, device=self.device).reshape(*sh)
+    pk = Pack(R, L, N, t(lay["rows_idx"], (R * L,)), t(lay["pack_idx"], (N,)), t(lay["flags"], (N,)),
+              t([x for row in lay["conv_src"] for x in row], (N, 3)),
+              t([x for row in lay["chunk_tok"] for x in row], (lay["NC"], len(lay["chunk_tok"][0]))),
+              t(lay["chunk_flags"], (lay["NC"],)), t(lay["tok_row"], (N,)), t(lay["tok_pos"], (N,)),
+              t([x for row in lay["q_tiles"] for x in row], (lay["NT"], 3)))
+    layers = forward_prefix(self.model, t(lay["ids"], (1, N)), pk, S)
+    Tensor.realize(*[x for pair in layers for x in pair])
+    return PrefixState(S, tuple(state_ids), layers)
+
+  def probs_with_prefix(self, prefix, enc:dict) -> list[list[float]]:
+    """Branch-only packed inference reusing a cached `PrefixState` (replayed via `TinyJit`)."""
+    from .packed import layout_branches
+    if tuple(enc["ids"][:prefix.S]) != prefix.state_ids:
+      raise ValueError("encoding state prefix does not match cached PrefixState")
+    lay = layout_branches(enc, prefix.S)
+    R, L, N = lay["R"], lay["L"], lay["N"]
+    n_decide, n_opts = len(lay["decide"]), len(lay["opts"])
+    key = ("prefix", prefix.S, R, L, N, lay["NC"], lay["NT"], lay["M_ro"], n_opts)
+    args = self._pack_inputs(key, lay) + list(prefix.tensors)
+    fn = lambda *a: self._packed_logits(*a, R=R, L=L, N=N, n_decide=n_decide, n_opts=n_opts)
+    if self.use_jit:
+      if (jit := self._jits.get(key)) is None: jit = self._jits.setdefault(key, TinyJit(fn, prune=True))
+      z = jit(*args)
+    else: z = fn(*args)
+    flat, out, i = z.tolist(), [], 0
+    for oi in enc["opt_idx"]:
+      zs = flat[i:i+len(oi)]; i += len(oi)
+      m = max(zs); e = [math.exp(v - m) for v in zs]; s = sum(e)
+      out.append([v / s for v in e])
     return out
 
   def probs(self, enc:dict) -> list[list[float]]:

@@ -80,4 +80,48 @@ class TestChunkedDelta(unittest.TestCase):
     self.assertLess(diff.max().item(), 2e-3)
     self.assertLess(diff.mean().item(), 2e-4)
 
+    # Cached-prefix split: run prefix alone (save state + last-3 conv inputs), then branches with prefix
+    N_p, N_b = 32, 80
+    toks_p, flags_p_ch = make_chunks(S, [], N_p, CHUNK_SIZE)
+    csrc_p = [[N_p, N_p, N_p] for _ in range(N_p)]
+    for t in range(S):
+      for j in range(3):
+        if t >= 3 - j: csrc_p[t][j] = t - 3 + j
+    p_pref_in = p[:S].cat(Tensor.zeros(N_p - S, P, dtype=dtypes.half, device=dev), dim=0).realize()
+    kp_prep = get_fused_conv_wy(H, N_p, len(toks_p), P, K, V, 0, q_dim, 2 * q_dim, qb, qc)
+    kp_scan = get_chunk_scan(H, N_p, len(toks_p), K, V, has_init=False, save_out=True)
+    Wp, Up = UOp.alloc((H, len(toks_p), 32, K), dtypes.half, device=dev), UOp.alloc((H, len(toks_p), 32, V), dtypes.half, device=dev)
+    Qgp, Kgp = UOp.alloc((H, len(toks_p), 32, K), dtypes.half, device=dev), UOp.alloc((H, len(toks_p), 32, K), dtypes.half, device=dev)
+    Lp, glp = UOp.alloc((H, len(toks_p), 32, 32), dtypes.half, device=dev), UOp.alloc((H, len(toks_p)), dtypes.float32, device=dev)
+    ct_p, cf_p, cs_p = (Tensor(x, dtype=dtypes.int32).realize() for x in (toks_p, flags_p_ch, csrc_p))
+    cp1 = kp_prep.call(Wp, Up, Qgp, Kgp, Lp, glp, p_pref_in.uop, w_conv.uop, dt_bias.uop, ssm_a.uop, ct_p.uop, cs_p.uop)
+    out_p, s_out = UOp.alloc((H, N_p, V), dtypes.float32, device=dev), UOp.alloc((H, V, K), dtypes.half, device=dev)
+    cp2 = kp_scan.call(out_p, Wp.after(cp1), Up.after(cp1), Qgp.after(cp1), Kgp.after(cp1), Lp.after(cp1), glp.after(cp1), ct_p.uop, cf_p.uop, s_out)
+    saved_S = Tensor(s_out.after(cp2)).realize()
+    conv_st = p[S - 3 : S, :qa].contiguous().realize()
+
+    b_shifted = [[idx - S for idx in b] for b in branches]
+    toks_b, flags_b_ch = make_chunks(0, b_shifted, N_b, CHUNK_SIZE)
+    csrc_b = [[N_b + 3, N_b + 3, N_b + 3] for _ in range(N_b)]
+    for b in b_shifted:
+      for tb, pb in enumerate(b):
+        for j in range(3):
+          off = tb - 3 + j
+          csrc_b[pb][j] = b[off] if off >= 0 else N_b + 3 + off
+    n_b = sum(blens)
+    p_b = p[S : S + n_b].cat(Tensor.zeros(N_b - n_b, P, dtype=dtypes.half, device=dev), dim=0).realize()
+    kb_prep = get_fused_conv_wy(H, N_b, len(toks_b), P, K, V, 0, q_dim, 2 * q_dim, qb, qc, has_prefix=True)
+    kb_scan = get_chunk_scan(H, N_b, len(toks_b), K, V, has_init=True, save_out=False)
+    Wb, Ub = UOp.alloc((H, len(toks_b), 32, K), dtypes.half, device=dev), UOp.alloc((H, len(toks_b), 32, V), dtypes.half, device=dev)
+    Qgb, Kgb = UOp.alloc((H, len(toks_b), 32, K), dtypes.half, device=dev), UOp.alloc((H, len(toks_b), 32, K), dtypes.half, device=dev)
+    Lb, glb = UOp.alloc((H, len(toks_b), 32, 32), dtypes.half, device=dev), UOp.alloc((H, len(toks_b)), dtypes.float32, device=dev)
+    ct_b, cf_b, cs_b = (Tensor(x, dtype=dtypes.int32).realize() for x in (toks_b, flags_b_ch, csrc_b))
+    cb1 = kb_prep.call(Wb, Ub, Qgb, Kgb, Lb, glb, p_b.uop, w_conv.uop, dt_bias.uop, ssm_a.uop, ct_b.uop, cs_b.uop, conv_st.uop)
+    out_b = UOp.alloc((H, N_b, V), dtypes.float32, device=dev)
+    cb2 = kb_scan.call(out_b, Wb.after(cb1), Ub.after(cb1), Qgb.after(cb1), Kgb.after(cb1), Lb.after(cb1), glb.after(cb1), ct_b.uop, cf_b.uop, saved_S.uop)
+    got_b = Tensor(out_b.after(cb2)).realize()
+    diff_b = (got_b[:, :n_b] - got[:, S : S + n_b]).abs()
+    self.assertLess(diff_b.max().item(), 2e-3)
+    self.assertLess(diff_b.mean().item(), 2e-4)
+
 if __name__ == "__main__": unittest.main()

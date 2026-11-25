@@ -35,6 +35,8 @@ TILES_M = {(112, 1024, 6144): (7, 4, 8), (112, 1024, 2048): (2, 2, 2), (112, 204
 TKN_SHAPES: dict[tuple[int, int], tuple[int, int, int, int, int, int]] = {
   (1024, 8224): (16, 32, 32, 1, 2, 4),   # DeltaNet fused qkv|gate|beta|alpha
   (1024, 5120): (16, 32, 32, 1, 2, 4),   # Attention fused q|k|v
+  (1024, 4096): (16, 32, 32, 1, 2, 4),   # Last-layer readout Q+gate
+  (1024, 1024): (16, 32, 32, 1, 2, 4),   # Last-layer fused K|V
   (3584, 1024): (16, 32, 32, 1, 2, 4),   # MLP down_proj
   (2048, 1024): (16, 32, 32, 1, 2, 4),   # ssm_out / attn_output
   (1024, 7168): (16, 64, 32, 1, 2, 4),   # fused gate+up

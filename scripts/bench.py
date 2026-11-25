@@ -30,6 +30,7 @@ def main():
   p.add_argument("--iters", type=int, default=10)
   p.add_argument("--warmup", type=int, default=2)
   p.add_argument("--dtype", choices=["f16", "f32"], default="f16")
+  p.add_argument("--cached-prefix", action="store_true", help="cache the shared state prefix once and time branch-only queries")
   p.add_argument("--no-jit", dest="jit", action="store_false", help="rebuild the graph every request (default: JIT replay)")
   p.set_defaults(jit=True)
   args = p.parse_args()
@@ -43,13 +44,20 @@ def main():
   rec, qmeta = to_record({"state": args.state, "questions": json.loads(args.questions)})
   enc = encode(tok, rec, max_state=args.max_context, max_branch=args.max_context, strict=True)
   state, _, rows = rows_of(enc)
-  print(f"load {load_s:.1f}s  dtype {args.dtype}  state {len(state)} tokens, {len(rows)} rows, "
+  mode = "cached-prefix" if args.cached_prefix else "packed"
+  print(f"load {load_s:.1f}s  dtype {args.dtype}  mode {mode}  state {len(state)} tokens, {len(rows)} rows, "
         f"row tokens {[len(state)+len(r['ids']) for r in rows]}, total {len(enc['ids'])}")
 
-  for _ in range(args.warmup): kev.probs(enc)
+  if args.cached_prefix:
+    prefix = kev.cache_prefix(state)
+    run = lambda: kev.probs_with_prefix(prefix, enc)
+  else:
+    run = lambda: kev.probs(enc)
+
+  for _ in range(args.warmup): run()
   times = []
   for _ in range(args.iters):
-    t = time.perf_counter(); probs = kev.probs(enc); times.append(time.perf_counter() - t)
+    t = time.perf_counter(); probs = run(); times.append(time.perf_counter() - t)
   times.sort()
   print(f"per request: min {times[0]*1000:.1f} ms  median {statistics.median(times)*1000:.1f} ms  "
         f"p90 {times[min(len(times)-1, int(0.9*len(times)))]*1000:.1f} ms  ({args.iters} iters)")

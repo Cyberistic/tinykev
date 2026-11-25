@@ -5,7 +5,7 @@ import unittest
 
 from tinygrad import Tensor, dtypes
 from tinygrad.llm.model import apply_rope, precompute_freqs_cis
-from tinykev.flash_attn import get_packed_flash_attn, get_packed_flash_attn_wmma, get_qk_norm_rope
+from tinykev.flash_attn import get_packed_flash_attn, get_packed_flash_attn_wmma, get_qk_norm_rope, get_ro_flash_attn, get_ro_qk_norm_rope
 from tinykev.gather import gather_rows
 from tinykev.packed import layout
 
@@ -73,5 +73,66 @@ class TestFlashAttn(unittest.TestCase):
     diff_w = (got_w[:n_real].float() - ref[:n_real].float()).abs()
     self.assertLess(diff_w.max().item(), 1e-2)
     self.assertLess(diff_w.mean().item(), 1e-3)
+
+    # Readout-only path: matches full packed Flash Attention at exact readout indices (decide + opts)
+    M_ro = lay["M_ro"]
+    ro_idx = lay["ro_idx"]
+    ro_row_t = Tensor(lay["ro_row"], dtype=dtypes.int32, device=p.device).realize()
+    ro_pos_t = Tensor(lay["ro_pos"], dtype=dtypes.int32, device=p.device).realize()
+    ro_idx_t = Tensor(ro_idx, dtype=dtypes.int32, device=p.device).realize()
+    q_ro_p = gather_rows(p[:, :k_off].contiguous(), ro_idx_t).realize()
+    kv_all_p = p[:, k_off:].contiguous().realize()
+    kr1 = get_ro_qk_norm_rope(M_ro, N, nh, nkv, hd, rope_dim, True, True, 1e-6, freqs.shape[0])
+    kr2 = get_ro_flash_attn(M_ro, N, R, L, nh, nkv, hd, True)
+    qrb = UOp.alloc((M_ro, nh, hd), dtypes.half, device=p.device)
+    krb = UOp.alloc((N, nkv, hd), dtypes.half, device=p.device)
+    cr1 = kr1.call(qrb, krb, q_ro_p.uop, kv_all_p.uop, qw.uop, kw.uop, freqs.uop, ro_pos_t.uop, tpos_t.uop)
+    orb = UOp.alloc((M_ro, nh * hd), dtypes.half, device=p.device)
+    cr2 = kr2.call(orb, qrb.after(cr1), krb.after(cr1), kv_all_p.uop, q_ro_p.uop, rows_t.uop, ro_row_t.uop, ro_pos_t.uop)
+    got_ro = Tensor(orb.after(cr2)).realize()
+    n_ro = len(lay["decide"]) + len(lay["opts"])
+    ref_ro = gather_rows(ref, ro_idx_t).realize()
+    diff_ro = (got_ro[:n_ro].float() - ref_ro[:n_ro].float()).abs()
+    self.assertLess(diff_ro.max().item(), 1e-2)
+    self.assertLess(diff_ro.mean().item(), 1e-3)
+
+    # Zero-copy cached-prefix WMMA + readout-only Flash Attention must match full packed attention
+    from tinykev.packed import layout_branches
+    lay_b = layout_branches(enc, S)
+    N_b, n_b = lay_b["N"], n_real - S
+    p_b = p[S:n_real].cat(Tensor.zeros(N_b - n_b, P, dtype=dtypes.half, device=p.device), dim=0).realize()
+    k_pref = Tensor(kb.after(c1))[:S].contiguous().realize()
+    v_pref = p[:S, v_off:].contiguous().realize()
+    rows_b_t = Tensor(lay_b["rows_idx"], dtype=dtypes.int32, device=p.device).realize()
+    tpos_b_t = Tensor(lay_b["tok_pos"], dtype=dtypes.int32, device=p.device).realize()
+    qt_b_t = Tensor(lay_b["q_tiles"], dtype=dtypes.int32, device=p.device).realize()
+    kb1 = get_qk_norm_rope(N_b, nh, nkv, hd, rope_dim, P, k_off, True, True, 1e-6, freqs.shape[0])
+    qbb, kbb = UOp.alloc((N_b, nh, hd), dtypes.half, device=p.device), UOp.alloc((N_b, nkv, hd), dtypes.half, device=p.device)
+    cb1 = kb1.call(qbb, kbb, p_b.uop, qw.uop, kw.uop, freqs.uop, tpos_b_t.uop)
+    kb2 = get_packed_flash_attn_wmma(N_b, lay_b["R"], lay_b["L"], lay_b["NT"], nh, nkv, hd, P, v_off, True, S)
+    obb = UOp.alloc((N_b, nh * hd), dtypes.half, device=p.device)
+    cb2 = kb2.call(obb, qbb.after(cb1), kbb.after(cb1), p_b.uop, rows_b_t.uop, qt_b_t.uop, k_pref.uop, v_pref.uop)
+    got_bp = Tensor(obb.after(cb2)).realize()
+    diff_bp = (got_bp[:n_b].float() - got_w[S:n_real].float()).abs()
+    self.assertLess(diff_bp.max().item(), 1e-2)
+    self.assertLess(diff_bp.mean().item(), 1e-3)
+
+    ro_b_idx_t = Tensor(lay_b["ro_idx"], dtype=dtypes.int32, device=p.device).realize()
+    ro_b_row_t = Tensor(lay_b["ro_row"], dtype=dtypes.int32, device=p.device).realize()
+    ro_b_pos_t = Tensor(lay_b["ro_pos"], dtype=dtypes.int32, device=p.device).realize()
+    q_rob_p = gather_rows(p_b[:, :k_off].contiguous(), ro_b_idx_t).realize()
+    kv_b_p = p_b[:, k_off:].contiguous().realize()
+    krb1 = get_ro_qk_norm_rope(lay_b["M_ro"], N_b, nh, nkv, hd, rope_dim, True, True, 1e-6, freqs.shape[0])
+    krb2 = get_ro_flash_attn(lay_b["M_ro"], N_b, lay_b["R"], lay_b["L"], nh, nkv, hd, True, S)
+    qrbb = UOp.alloc((lay_b["M_ro"], nh, hd), dtypes.half, device=p.device)
+    krbb = UOp.alloc((N_b, nkv, hd), dtypes.half, device=p.device)
+    crb1 = krb1.call(qrbb, krbb, q_rob_p.uop, kv_b_p.uop, qw.uop, kw.uop, freqs.uop, ro_b_pos_t.uop, tpos_b_t.uop)
+    orbb = UOp.alloc((lay_b["M_ro"], nh * hd), dtypes.half, device=p.device)
+    crb2 = krb2.call(orbb, qrbb.after(crb1), krbb.after(crb1), kv_b_p.uop, q_rob_p.uop, rows_b_t.uop, ro_b_row_t.uop, ro_b_pos_t.uop,
+                     k_pref.uop, v_pref.uop)
+    got_rob = Tensor(orbb.after(crb2)).realize()
+    diff_rob = (got_rob[:n_ro].float() - got_ro[:n_ro].float()).abs()
+    self.assertLess(diff_rob.max().item(), 1e-2)
+    self.assertLess(diff_rob.mean().item(), 1e-3)
 
 if __name__ == "__main__": unittest.main()

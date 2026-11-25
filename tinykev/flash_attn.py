@@ -168,12 +168,12 @@ def _build_packed_flash_attn(N:int, R:int, L:int, nh:int, nkv:int, hd:int, P:int
   return out[t, h * hd + d_o].store(val.cast(dtypes.half)).end(e_o).end(lane, th).sink(
     arg=KernelInfo(name=f"packed_flash_attn_{N}_{R}_{L}_{nh}_{nkv}", opts_to_apply=()))
 
-def make_q_tiles(S:int, branches:list[list[int]], L:int, BM:int=16) -> list[list[int]]:
-  """List of `[row_r, q_start, q_len]` tiles covering every real packed token once (prefix in row 0 only)."""
+def make_q_tiles(S:int, branches:list[list[int]], L:int, BM:int=16, prefix_cached:bool=False) -> list[list[int]]:
+  """List of `[row_r, q_start, q_len]` tiles covering every active packed token once."""
   tiles: list[list[int]] = []
   for r, b in enumerate(branches):
     row_len = S + len(b)
-    cur = 0 if r == 0 else S
+    cur = S if (prefix_cached or r > 0) else 0
     while cur < row_len:
       ln = min(BM, row_len - cur)
       tiles.append([r, cur, ln])
@@ -183,12 +183,14 @@ def make_q_tiles(S:int, branches:list[list[int]], L:int, BM:int=16) -> list[list
 def _load2(buf_flat:UOp, off:UOp) -> UOp:
   return UOp(Ops.SHRINK, src=(buf_flat, off, UOp.const(2))).load()
 
-def _build_packed_flash_attn_wmma(N:int, R:int, L:int, NT:int, nh:int, nkv:int, hd:int, P:int, v_off:int, gated:bool) -> UOp:
+def _build_packed_flash_attn_wmma(N:int, R:int, L:int, NT:int, nh:int, nkv:int, hd:int, P:int, v_off:int,
+                                  gated:bool, S_p:int=0) -> UOp:
   """WMMA-accelerated packed block-causal Flash Attention (< 14 KB LDS -> 2 TGs/core on Apple Silicon).
 
   Grid: `NT * nh` threadgroups; Local: 4 warps (128 threads), each warp owns 64 dims of `Q` and `O`.
   Both `S = Q @ K^T` and `O += P @ V` run on Metal 8x8x8 tensor cores (`UOp.wmma`), with 16-lane
-  `simd_shuffle_xor` online softmax and fused `* sigmoid(gate)` on output store."""
+  `simd_shuffle_xor` online softmax and fused `* sigmoid(gate)` on output store.
+  When `S_p > 0` (cached-prefix mode), reads `k_pref`/`v_pref` directly for `rows_idx < S_p` with zero `cat`."""
   BM, BN = 16, 16
   assert hd == 256 and nh % nkv == 0
   gqa = nh // nkv
@@ -200,6 +202,8 @@ def _build_packed_flash_attn_wmma(N:int, R:int, L:int, NT:int, nh:int, nkv:int, 
   p_in = UOp.param(3, dtypes.half, (N, P))
   rows_idx = UOp.param(4, dtypes.int32, (R * L,))
   q_tiles = UOp.param(5, dtypes.int32, (NT, 3))
+  k_pref = UOp.param(6, dtypes.half, (S_p, nkv, hd)) if S_p > 0 else None
+  v_pref = UOp.param(7, dtypes.half, (S_p, nkv * hd)) if S_p > 0 else None
 
   th = UOp.range(NT * nh, 0, AxisType.GLOBAL)
   ti, h = th // nh, th % nh
@@ -216,7 +220,7 @@ def _build_packed_flash_attn_wmma(N:int, R:int, L:int, NT:int, nh:int, nkv:int, 
   q_len = q_tiles[ti, 2].load().maximum(1).minimum(BM)
   row_base = row_r * L
 
-  # LDS: KV(8.32 KB) + S_part(4.61 KB) + P(0.64 KB) + m/l/a(0.19 KB) = 13.76 KB (< 16 KB)
+  # LDS: KV(8.32 KB) + S_part(4.61 KB) + P(0.64 KB) + m/l/a(0.19 KB) = 13.76 KB (< 16 KB, 4 barriers/tile)
   D_STR, P_STR = hd + 4, BN + 4
   KV_raw = UOp.alloc((BN * D_STR,), dtypes.half, addrspace=AddrSpace.LOCAL)
   KV_lds = KV_raw.reshape(BN, D_STR)
@@ -238,7 +242,8 @@ def _build_packed_flash_attn_wmma(N:int, R:int, L:int, NT:int, nh:int, nkv:int, 
   for im in range(2):
     ql = im * 8 + m_lane
     qpos = (q_start + ql).minimum(L - 1)
-    qtok = rows_idx[row_base + qpos].load().maximum(0).minimum(N - 1)
+    qraw = rows_idx[row_base + qpos].load()
+    qtok = ((qraw - S_p) if S_p else qraw).maximum(0).minimum(N - 1)
     vq = ql < q_len
     for ik in range(8):
       d0 = wid * 64 + ik * 8 + n_base
@@ -257,16 +262,24 @@ def _build_packed_flash_attn_wmma(N:int, R:int, L:int, NT:int, nh:int, nkv:int, 
   k_base = kt * BN
   tile_active = k_base < (q_start + q_len)
 
-  # 1. Cooperatively load K[k_base : k_base+16, 0:256] -> KV_lds
+  # 1. Cooperatively load K[k_base : k_base+16, 0:256] -> KV_lds (directly from k_pref when ktok < S_p)
   li = UOp.range(BN, 10)
   kpos = k_base + li
   vk = tile_active & (kpos < (q_start + q_len))
-  ktok = rows_idx[(row_base + kpos.minimum(L - 1)).valid(vk)].load().maximum(0).minimum(N - 1)
+  ktok = rows_idx[(row_base + kpos.minimum(L - 1)).valid(vk)].load()
   KV_k_cur = KV_lds.after(kt)
-  st_k = UOp.group(
-    KV_k_cur[li, tid * 2].store(vk.where(k_in[ktok.valid(vk), kh, tid * 2].load(), UOp.const(0.0, dtypes.half))),
-    KV_k_cur[li, tid * 2 + 1].store(vk.where(k_in[ktok.valid(vk), kh, tid * 2 + 1].load(), UOp.const(0.0, dtypes.half))),
-  ).end(li).barrier()
+  if S_p > 0:
+    is_pk = ktok < S_p
+    kp_i, kb_i = ktok.maximum(0).minimum(S_p - 1), (ktok - S_p).maximum(0).minimum(N - 1)
+    k_v0 = is_pk.where(k_pref[kp_i.valid(vk & is_pk), kh, tid * 2].load(),
+                       k_in[kb_i.valid(vk & is_pk.logical_not()), kh, tid * 2].load())
+    k_v1 = is_pk.where(k_pref[kp_i.valid(vk & is_pk), kh, tid * 2 + 1].load(),
+                       k_in[kb_i.valid(vk & is_pk.logical_not()), kh, tid * 2 + 1].load())
+  else:
+    ktok_s = ktok.maximum(0).minimum(N - 1)
+    k_v0 = k_in[ktok_s.valid(vk), kh, tid * 2].load()
+    k_v1 = k_in[ktok_s.valid(vk), kh, tid * 2 + 1].load()
+  st_k = UOp.group(KV_k_cur[li, tid * 2].store(k_v0), KV_k_cur[li, tid * 2 + 1].store(k_v1)).end(li).barrier()
   K_r = KV_lds.after(st_k)
 
   # 2. Each warp computes its 64-dim partial of S[16, 16] via UOp.wmma
@@ -312,17 +325,25 @@ def _build_packed_flash_attn_wmma(N:int, R:int, L:int, NT:int, nh:int, nkv:int, 
     st_sm.append(l_lds[r_local.valid(col16.eq(0))].store(l_new))
     st_sm.append(a_lds.after(kt)[r_local.valid(col16.eq(0))].store(alpha))
 
-  # 4. Load V[k_base : k_base+16, 0:256] -> KV_lds (overwriting K) before the PV barrier
+  # 4. Load V[k_base : k_base+16, 0:256] -> KV_lds (overwriting K) in parallel with softmax before one PV barrier
   li_v = UOp.range(BN, 11)
   kpos_v = k_base + li_v
   vv = tile_active & (kpos_v < (q_start + q_len))
-  vtok = rows_idx[(row_base + kpos_v.minimum(L - 1)).valid(vv)].load().maximum(0).minimum(N - 1)
+  vtok = rows_idx[(row_base + kpos_v.minimum(L - 1)).valid(vv)].load()
   KV_v_cur = KV_lds.after(b_sp)
   v_off_kh = v_off + kh * hd
-  st_v = UOp.group(
-    KV_v_cur[li_v, tid * 2].store(vv.where(p_in[vtok.valid(vv), v_off_kh + tid * 2].load(), UOp.const(0.0, dtypes.half))),
-    KV_v_cur[li_v, tid * 2 + 1].store(vv.where(p_in[vtok.valid(vv), v_off_kh + tid * 2 + 1].load(), UOp.const(0.0, dtypes.half))),
-  ).end(li_v)
+  if S_p > 0:
+    is_pv = vtok < S_p
+    vp_i, vb_i = vtok.maximum(0).minimum(S_p - 1), (vtok - S_p).maximum(0).minimum(N - 1)
+    v_v0 = is_pv.where(v_pref[vp_i.valid(vv & is_pv), kh * hd + tid * 2].load(),
+                       p_in[vb_i.valid(vv & is_pv.logical_not()), v_off_kh + tid * 2].load())
+    v_v1 = is_pv.where(v_pref[vp_i.valid(vv & is_pv), kh * hd + tid * 2 + 1].load(),
+                       p_in[vb_i.valid(vv & is_pv.logical_not()), v_off_kh + tid * 2 + 1].load())
+  else:
+    vtok_s = vtok.maximum(0).minimum(N - 1)
+    v_v0 = p_in[vtok_s.valid(vv), v_off_kh + tid * 2].load()
+    v_v1 = p_in[vtok_s.valid(vv), v_off_kh + tid * 2 + 1].load()
+  st_v = UOp.group(KV_v_cur[li_v, tid * 2].store(v_v0), KV_v_cur[li_v, tid * 2 + 1].store(v_v1)).end(li_v)
 
   b_pv = UOp.group(*st_sm, st_v).barrier()
   P_raw_r, V_raw_r, a_r = P_raw.after(b_pv), KV_raw.after(b_pv), a_lds.after(b_pv)
@@ -352,7 +373,8 @@ def _build_packed_flash_attn_wmma(N:int, R:int, L:int, NT:int, nh:int, nkv:int, 
     ql = im * 8 + m_lane
     vq = ql < q_len
     qpos = (q_start + ql).minimum(L - 1)
-    qtok = rows_idx[row_base + qpos].load().maximum(0).minimum(N - 1)
+    qraw = rows_idx[row_base + qpos].load()
+    qtok = ((qraw - S_p) if S_p else qraw).maximum(0).minimum(N - 1)
     inv_l = l_f[ql].load().reciprocal()
     for id8 in range(8):
       for e in range(2):
@@ -362,7 +384,191 @@ def _build_packed_flash_attn_wmma(N:int, R:int, L:int, NT:int, nh:int, nkv:int, 
           gv = p_in[qtok, h * 2 * hd + hd + d].load().float()
           val = val * ((-gv * LOG2E).exp2() + 1.0).reciprocal()
         st_out.append(out[qtok.valid(vq), h * hd + d].store(val.cast(dtypes.half)))
-  return UOp.group(*st_out).end(lane, wid, th).sink(arg=KernelInfo(name=f"packed_flash_attn_wmma_{N}_{R}_{L}_{NT}", opts_to_apply=()))
+  sfx = f"_p{S_p}" if S_p > 0 else ""
+  return UOp.group(*st_out).end(lane, wid, th).sink(arg=KernelInfo(name=f"packed_flash_attn_wmma_{N}_{R}_{L}_{NT}{sfx}", opts_to_apply=()))
+
+def _build_ro_qk_norm_rope(M_ro:int, N:int, nh:int, nkv:int, hd:int, rope_dim:int,
+                           gated:bool, has_norm:bool, eps:float, max_pos:int) -> UOp:
+  """Readout-only QK-RMSNorm + partial NeoX RoPE: rotates `q_ro [M_ro, Q_P]` and `kv_all [N, 2*nkv*hd]` (K half)."""
+  assert hd % 32 == 0 and rope_dim == 64 and hd >= 64
+  E = hd // 32
+  q_stride = 2 * hd if gated else hd
+  q_out = UOp.param(0, dtypes.half, (M_ro, nh, hd))
+  k_out = UOp.param(1, dtypes.half, (N, nkv, hd))
+  q_ro = UOp.param(2, dtypes.half, (M_ro, nh * q_stride))
+  kv_all = UOp.param(3, dtypes.half, (N, 2 * nkv * hd))
+  qw = UOp.param(4, dtypes.half, (hd,))
+  kw = UOp.param(5, dtypes.half, (hd,))
+  freqs = UOp.param(6, dtypes.float32, (max_pos, rope_dim))
+  ro_pos = UOp.param(7, dtypes.int32, (M_ro,))
+  tok_pos = UOp.param(8, dtypes.int32, (N,))
+
+  n_qw = M_ro * nh
+  w = UOp.range(n_qw + N * nkv, 0, AxisType.GLOBAL)
+  is_q = w < n_qw
+  qi = (w // nh).minimum(M_ro - 1)
+  hq = w % nh
+  kw_i = (w - n_qw).maximum(0)
+  ki = (kw_i // nkv).minimum(N - 1)
+  hk = kw_i % nkv
+  lane = UOp.range(32, -1, AxisType.WARP)
+
+  reg = UOp.alloc((E,), dtypes.float32, addrspace=AddrSpace.REG)
+  c_r = UOp.range(E, 2, AxisType.UPCAST)
+  d = lane + c_r * 32
+  xv = is_q.where(q_ro[qi, hq * q_stride + d].load().float(), kv_all[ki, hk * hd + d].load().float())
+  reg = reg.after(reg[c_r].store(xv).end(c_r))
+
+  if has_norm:
+    sq = _simd_sum((reg[c_r].load() * reg[c_r].load()).reduce(c_r, arg=(Ops.ADD, 0)))
+    inv = (sq * (1.0 / hd) + eps).rsqrt()
+    vals = []
+    for c in range(E):
+      dc = lane + c * 32
+      wt = is_q.where(qw[dc].load(), kw[dc].load())
+      vals.append(((reg[c].load() * inv).cast(dtypes.half) * wt).float())
+  else:
+    vals = [reg[c].load() for c in range(E)]
+
+  pos = is_q.where(ro_pos[qi].load(), tok_pos[ki].load()).maximum(0).minimum(max_pos - 1)
+  cos, sin = freqs[pos, lane].load(), freqs[pos, lane + 32].load()
+  out_vals = [vals[0] * cos - vals[1] * sin, vals[1] * cos + vals[0] * sin] + vals[2:]
+
+  sts = []
+  for c in range(E):
+    dc = lane + c * 32
+    vh = out_vals[c].cast(dtypes.half)
+    sts.append(q_out[qi.valid(is_q), hq, dc].store(vh))
+    sts.append(k_out[ki.valid(is_q.eq(False)), hk, dc].store(vh))
+  return UOp.group(*sts).end(lane, w).sink(arg=KernelInfo(name=f"ro_qk_norm_rope_{M_ro}_{N}", opts_to_apply=()))
+
+def _build_ro_flash_attn(M_ro:int, N:int, R:int, L:int, nh:int, nkv:int, hd:int, gated:bool, S_p:int=0) -> UOp:
+  """Zero-LDS readout-only packed Flash Attention: runs only on `M_ro` query tokens, with optional zero-copy `S_p` KV prefix."""
+  assert hd % 32 == 0 and nh % nkv == 0
+  E, gqa, scale = hd // 32, nh // nkv, hd ** -0.5
+  q_stride = 2 * hd if gated else hd
+
+  out = UOp.param(0, dtypes.half, (M_ro, nh * hd))
+  q_in = UOp.param(1, dtypes.half, (M_ro, nh, hd))
+  k_in = UOp.param(2, dtypes.half, (N, nkv, hd))
+  kv_all = UOp.param(3, dtypes.half, (N, 2 * nkv * hd))
+  q_ro = UOp.param(4, dtypes.half, (M_ro, nh * q_stride))
+  rows_idx = UOp.param(5, dtypes.int32, (R * L,))
+  ro_row = UOp.param(6, dtypes.int32, (M_ro,))
+  ro_pos = UOp.param(7, dtypes.int32, (M_ro,))
+  k_pref = UOp.param(8, dtypes.half, (S_p, nkv, hd)) if S_p > 0 else None
+  v_pref = UOp.param(9, dtypes.half, (S_p, nkv * hd)) if S_p > 0 else None
+
+  th = UOp.range(M_ro * nh, 0, AxisType.GLOBAL)
+  t, h = th // nh, th % nh
+  kh = h // gqa
+  lane = UOp.range(32, -1, AxisType.WARP)
+
+  q_reg = UOp.alloc((E,), dtypes.float32, addrspace=AddrSpace.REG)
+  e_u = UOp.range(E, 2, AxisType.UPCAST)
+  d = lane * E + e_u
+  q_reg = q_reg.after(q_reg[e_u].store(q_in[t, h, d].load().float() * scale).end(e_u))
+
+  acc = UOp.alloc((E,), dtypes.float32, addrspace=AddrSpace.REG)
+  m_reg = UOp.alloc((1,), dtypes.float32, addrspace=AddrSpace.REG)
+  l_reg = UOp.alloc((1,), dtypes.float32, addrspace=AddrSpace.REG)
+  acc = acc.after(acc[e_u].store(0.0).end(e_u))
+  m_reg = m_reg.after(m_reg[0].store(UOp.const(-1e30, dtypes.float32)))
+  l_reg = l_reg.after(l_reg[0].store(0.0))
+
+  row_base = ro_row[t].load().maximum(0).minimum(R - 1) * L
+  pos_t = ro_pos[t].load().maximum(0).minimum(L - 1)
+
+  j = UOp.range(L, 10)
+  valid_j = j <= pos_t
+  kj = rows_idx[(row_base + j).valid(valid_j)].load()
+  v_off_kh = nkv * hd + kh * hd
+  if S_p > 0:
+    is_p = kj < S_p
+    kp_i, kb_i = kj.maximum(0).minimum(S_p - 1), (kj - S_p).maximum(0).minimum(N - 1)
+    k_val = is_p.where(k_pref[kp_i.valid(valid_j & is_p), kh, d].load(),
+                       k_in[kb_i.valid(valid_j & is_p.logical_not()), kh, d].load()).float()
+    v_val = is_p.where(v_pref[kp_i.valid(valid_j & is_p), kh * hd + d].load(),
+                       kv_all[kb_i.valid(valid_j & is_p.logical_not()), v_off_kh + d].load()).float()
+  else:
+    kj_s = kj.maximum(0).minimum(N - 1)
+    k_val = k_in[kj_s.valid(valid_j), kh, d].load().float()
+    v_val = kv_all[kj_s.valid(valid_j), v_off_kh + d].load().float()
+
+  dot_l = (q_reg[e_u].load() * k_val).reduce(e_u, arg=(Ops.ADD, 0))
+  score = valid_j.where(_simd_sum(dot_l), UOp.const(-1e30, dtypes.float32))
+
+  m_prev, l_prev = m_reg.after(j)[0].load(), l_reg.after(j)[0].load()
+  m_new = m_prev.maximum(score)
+  alpha = ((m_prev - m_new) * LOG2E).exp2()
+  w = valid_j.where(((score - m_new) * LOG2E).exp2(), UOp.const(0.0, dtypes.float32))
+
+  acc_prev = acc.after(j)
+  upd = UOp.group(
+    m_reg[0].store(m_new),
+    l_reg[0].store(l_prev * alpha + w),
+    acc[e_u].store(acc_prev[e_u].load() * alpha + w * v_val).end(e_u),
+  ).end(j)
+
+  inv_l = l_reg.after(upd)[0].load().reciprocal()
+  acc_f = acc.after(upd)
+  e_o = UOp.range(E, 3, AxisType.UPCAST)
+  d_o = lane * E + e_o
+  val = acc_f[e_o].load() * inv_l
+  if gated:
+    gv = q_ro[t, h * 2 * hd + hd + d_o].load().float()
+    val = val * ((-gv * LOG2E).exp2() + 1.0).reciprocal()
+  sfx = f"_p{S_p}" if S_p > 0 else ""
+  return out[t, h * hd + d_o].store(val.cast(dtypes.half)).end(e_o).end(lane, th).sink(
+    arg=KernelInfo(name=f"ro_flash_attn_{M_ro}_{N}_{L}{sfx}", opts_to_apply=()))
+
+@functools.cache
+def get_ro_qk_norm_rope(M_ro:int, N:int, nh:int, nkv:int, hd:int, rope_dim:int,
+                        gated:bool, has_norm:bool, eps:float, max_pos:int) -> UOp:
+  return _emit(f"ro_qk_norm_rope_{M_ro}_{N}_{nh}_{nkv}_{hd}_{int(gated)}_{int(has_norm)}",
+               _build_ro_qk_norm_rope(M_ro, N, nh, nkv, hd, rope_dim, gated, has_norm, eps, max_pos))
+
+@functools.cache
+def get_ro_flash_attn(M_ro:int, N:int, R:int, L:int, nh:int, nkv:int, hd:int, gated:bool, S_p:int=0) -> UOp:
+  sfx = f"_p{S_p}" if S_p > 0 else ""
+  return _emit(f"ro_flash_attn_{M_ro}_{N}_{R}_{L}_{nh}_{nkv}_{hd}_{int(gated)}{sfx}",
+               _build_ro_flash_attn(M_ro, N, R, L, nh, nkv, hd, gated, S_p))
+
+def packed_attention_readout(blk, q_ro:Tensor, kv_all:Tensor, pk,
+                             k_prefix:Tensor|None=None, v_prefix:Tensor|None=None) -> Tensor|None:
+  """Readout-only packed Flash Attention: `q_ro (M_ro, Q_P)` + `kv_all (N, 2*nkv*hd)` -> `(M_ro, nh*hd)` f16."""
+  cfg = blk.config
+  nh, nkv, hd, rope_dim = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rope_dim
+  if not enabled() or not _is_metal(q_ro.device) or q_ro.dtype is not dtypes.float16 or kv_all.dtype is not dtypes.float16:
+    return None
+  if rope_dim != 64 or hd % 32 != 0 or hd < 64 or nh % nkv != 0: return None
+  has_norm = (cfg.qk_norm == hd)
+  if cfg.qk_norm and not has_norm: return None
+  M_ro, N = q_ro.shape[-2], pk.N
+  freqs = blk.freqs_cis
+  if freqs.dtype is not dtypes.float32: freqs = freqs.float()
+  max_pos = freqs.shape[0]
+  qw = blk.attn_q_norm.weight if has_norm else Tensor.ones(hd, dtype=dtypes.half, device=q_ro.device)
+  kw = blk.attn_k_norm.weight if has_norm else qw
+  if qw.dtype is not dtypes.float16 or kw.dtype is not dtypes.float16: return None
+
+  k1 = get_ro_qk_norm_rope(M_ro, N, nh, nkv, hd, rope_dim, cfg.attn_output_gate, has_norm, cfg.norm_eps, max_pos)
+  dev = q_ro.device
+  q2, kv2 = q_ro.reshape(M_ro, -1).contiguous().uop, kv_all.reshape(N, -1).contiguous().uop
+  q_buf = UOp.alloc((M_ro, nh, hd), dtypes.half, device=dev)
+  k_buf = UOp.alloc((N, nkv, hd), dtypes.half, device=dev)
+  c1 = k1.call(q_buf, k_buf, q2, kv2, qw.contiguous().uop, kw.contiguous().uop,
+               freqs.contiguous().uop, pk.ro_pos.uop, pk.tok_pos.uop)
+  out = UOp.alloc((M_ro, nh * hd), dtypes.half, device=dev)
+  if k_prefix is not None and v_prefix is not None:
+    S_p = k_prefix.shape[0]
+    k2 = get_ro_flash_attn(M_ro, N, pk.R, pk.L, nh, nkv, hd, cfg.attn_output_gate, S_p)
+    c2 = k2.call(out, q_buf.after(c1), k_buf.after(c1), kv2, q2, pk.rows_idx.uop, pk.ro_row.uop, pk.ro_pos.uop,
+                 k_prefix.contiguous().uop, v_prefix.contiguous().uop)
+  else:
+    k2 = get_ro_flash_attn(M_ro, N, pk.R, pk.L, nh, nkv, hd, cfg.attn_output_gate)
+    c2 = k2.call(out, q_buf.after(c1), k_buf.after(c1), kv2, q2, pk.rows_idx.uop, pk.ro_row.uop, pk.ro_pos.uop)
+  return Tensor(out.after(c2))
 
 @functools.cache
 def get_qk_norm_rope(N:int, nh:int, nkv:int, hd:int, rope_dim:int, P:int, k_off:int,
@@ -376,12 +582,17 @@ def get_packed_flash_attn(N:int, R:int, L:int, nh:int, nkv:int, hd:int, P:int, v
                _build_packed_flash_attn(N, R, L, nh, nkv, hd, P, v_off, gated))
 
 @functools.cache
-def get_packed_flash_attn_wmma(N:int, R:int, L:int, NT:int, nh:int, nkv:int, hd:int, P:int, v_off:int, gated:bool) -> UOp:
-  return _emit(f"flash_attn_wmma_{N}_{R}_{L}_{NT}_{nh}_{nkv}_{hd}_{P}_{int(gated)}",
-               _build_packed_flash_attn_wmma(N, R, L, NT, nh, nkv, hd, P, v_off, gated))
+def get_packed_flash_attn_wmma(N:int, R:int, L:int, NT:int, nh:int, nkv:int, hd:int, P:int, v_off:int,
+                               gated:bool, S_p:int=0) -> UOp:
+  sfx = f"_p{S_p}" if S_p > 0 else ""
+  return _emit(f"flash_attn_wmma_{N}_{R}_{L}_{NT}_{nh}_{nkv}_{hd}_{P}_{int(gated)}{sfx}",
+               _build_packed_flash_attn_wmma(N, R, L, NT, nh, nkv, hd, P, v_off, gated, S_p))
 
-def packed_attention(blk, p:Tensor, pk) -> Tensor|None:
-  """Run fused QK-norm+RoPE and packed Flash Attention directly on fused `p = _qkv(x)` -> `(N, nh*hd)` f16."""
+def packed_attention(blk, p:Tensor, pk, k_prefix:Tensor|None=None, v_prefix:Tensor|None=None,
+                     return_kv:int=0) -> Tensor|tuple[Tensor, Tensor, Tensor]|None:
+  """Run fused QK-norm+RoPE and packed Flash Attention directly on fused `p = _qkv(x)` -> `(N, nh*hd)` f16.
+
+  When `return_kv > 0`, returns `(out, k_rot[:return_kv], v[:return_kv])` for prefix caching."""
   cfg = blk.config
   nh, nkv, hd, rope_dim = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rope_dim
   if not enabled() or not _is_metal(p.device) or p.dtype is not dtypes.float16: return None
@@ -399,15 +610,26 @@ def packed_attention(blk, p:Tensor, pk) -> Tensor|None:
 
   k1 = get_qk_norm_rope(N, nh, nkv, hd, rope_dim, P, k_off, cfg.attn_output_gate, has_norm, cfg.norm_eps, max_pos)
   dev = p.device
-  p2 = p.reshape(N, P).contiguous().uop
+  p_2d = p.reshape(N, P).contiguous()
+  p2 = p_2d.uop
   q_buf = UOp.alloc((N, nh, hd), dtypes.half, device=dev)
   k_buf = UOp.alloc((N, nkv, hd), dtypes.half, device=dev)
   c1 = k1.call(q_buf, k_buf, p2, qw.contiguous().uop, kw.contiguous().uop, freqs.contiguous().uop, pk.tok_pos.uop)
   out = UOp.alloc((N, nh * hd), dtypes.half, device=dev)
+  if k_prefix is not None and v_prefix is not None:
+    if hd != 256 or pk.q_tiles is None: return None
+    S_p = k_prefix.shape[0]
+    k2 = get_packed_flash_attn_wmma(N, pk.R, pk.L, pk.q_tiles.shape[0], nh, nkv, hd, P, v_off, cfg.attn_output_gate, S_p)
+    c2 = k2.call(out, q_buf.after(c1), k_buf.after(c1), p2, pk.rows_idx.uop, pk.q_tiles.uop,
+                 k_prefix.contiguous().uop, v_prefix.contiguous().uop)
+    return Tensor(out.after(c2))
   if hd == 256 and pk.q_tiles is not None:
     k2 = get_packed_flash_attn_wmma(N, pk.R, pk.L, pk.q_tiles.shape[0], nh, nkv, hd, P, v_off, cfg.attn_output_gate)
     c2 = k2.call(out, q_buf.after(c1), k_buf.after(c1), p2, pk.rows_idx.uop, pk.q_tiles.uop)
   else:
     k2 = get_packed_flash_attn(N, pk.R, pk.L, nh, nkv, hd, P, v_off, cfg.attn_output_gate)
     c2 = k2.call(out, q_buf.after(c1), k_buf.after(c1), p2, pk.rows_idx.uop, pk.tok_row.uop, pk.tok_pos.uop)
-  return Tensor(out.after(c2))
+  res = Tensor(out.after(c2))
+  if return_kv > 0:
+    return res, Tensor(k_buf.after(c1))[:return_kv].contiguous(), p_2d[:return_kv, v_off:].contiguous()
+  return res

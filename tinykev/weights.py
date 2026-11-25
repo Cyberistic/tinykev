@@ -259,6 +259,10 @@ def prepare_linears(model:Transformer) -> int:
           and getattr(lin, "weight", None) is not None and lin.weight.dtype is dtypes.float16 and not hasattr(lin, "_weight_t"):
         lin._weight_t = lin.weight.T.contiguous().realize()
         n += 1
+  # Pre-slice fused KV weight `[K, n_k + n_v]` on the final full-attention block for lossless readout pruning
+  if model.blk and hasattr(model.blk[-1], "_qkv") and hasattr(model.blk[-1]._qkv, "_weight_t"):
+    a = model.blk[-1]._qkv_ends[0]
+    model.blk[-1]._kv_t = model.blk[-1]._qkv._weight_t[:, a:].contiguous().realize()
   return n
 
 @dataclass
